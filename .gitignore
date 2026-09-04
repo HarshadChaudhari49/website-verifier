@@ -1,0 +1,56 @@
+# ==============================================================
+#  Only System 2 (automation2/) is tracked for now.
+#  Everything below is either secret, machine-local, or run output.
+# ==============================================================
+
+# --- System 1: not part of this repo yet ---
+automation1/
+
+# --- Project notes: kept local, documents the live portal ---
+CLAUDE.md
+
+# --- Credentials: never commit ---
+.env
+.env2
+.env2.bak
+**/.env
+**/.env2
+**/.env2.bak
+*.env
+
+# --- Browser session cookies: a logged-in ChatGPT session ---
+chatgpt_profile2/
+chatgpt_profile2_*/
+**/chatgpt_profile2/
+**/chatgpt_profile2_*/
+
+# --- Run output: portal screenshots, form dumps with CSRF tokens,
+#     and the per-record run logs ---
+debug/
+debug2/
+**/debug/
+**/debug2/
+*.png
+*.log
+gpt_flow_log.csv
+run_log.csv
+portal_form_debug*
+
+# --- The source PDF: 4.3 MB binary, superseded by MASTER_RULES.md,
+#     which is what the code actually reads ---
+master doc for verification.pdf
+*.pdf
+
+# --- Python ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
