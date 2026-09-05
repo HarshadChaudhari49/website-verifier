@@ -2707,6 +2707,64 @@ def discard_fallback_profiles():
         print(f"  cleaned up {removed} leftover one-off browser profile(s)")
 
 
+DEBUG_ARTEFACTS_TO_KEEP = 25
+
+# Never deleted, whatever their age. gpt_flow_log.csv is the record of
+# what this mode submitted to live portal records -- the audit trail --
+# and run_log.csv is the same for System 1.
+DEBUG_KEEP_FOREVER_SUFFIXES = (".csv", ".log")
+
+
+def prune_debug_artefacts(keep=None):
+    """
+    Keep the most recent screenshots and form dumps, delete older ones.
+
+    debug2/ grows without limit: every failed attach, rejected
+    composer, unready form and form dump lands there, and 51 files had
+    built up. Only the newest are ever of any use -- a screenshot from
+    two days ago explains nothing about today's run.
+
+    A count cap rather than an age cutoff, because a single bad hour
+    can produce dozens of files while a quiet week produces none.
+
+    The run logs are never touched, whatever the cap.
+    """
+    if keep is None:
+        keep = DEBUG_ARTEFACTS_TO_KEEP
+
+    folder = os.path.dirname(debug_path("x"))
+    try:
+        names = os.listdir(folder)
+    except Exception:
+        return
+
+    artefacts = []
+    for name in names:
+        if name.lower().endswith(DEBUG_KEEP_FOREVER_SUFFIXES):
+            continue
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            artefacts.append((os.path.getmtime(path), path))
+        except Exception:
+            continue
+
+    if len(artefacts) <= keep:
+        return
+
+    artefacts.sort(reverse=True)          # newest first
+    removed = 0
+    for _, path in artefacts[keep:]:
+        try:
+            os.remove(path)
+            removed += 1
+        except Exception:
+            pass
+    if removed:
+        print(f"  pruned {removed} old debug artefact(s), kept the newest {keep}")
+
+
 def portal_on_admin_console(portal):
     """True when the portal is showing its Admin Console listing."""
     try:
@@ -2852,6 +2910,7 @@ def gpt_flow_mode(playwright):
         # Three of them had accumulated to 118 MB before this cleanup
         # existed.
         discard_fallback_profiles()
+        prune_debug_artefacts()
     except Exception as exc:
         # A Firefox left running from an earlier run keeps parent.lock
         # held, and the profile cannot be reused while it does. Rather
