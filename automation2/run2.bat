@@ -1,18 +1,33 @@
 @echo off
 REM ==============================================================
-REM  Website verifier -- SYSTEM 2 (second copy, second login).
-REM  Double-click this file to start a SYSTEM 2 run.
+REM  Website verifier -- SYSTEM 2.
+REM  Double-click this file to start the portal + ChatGPT flow.
 REM
-REM  This runs website_verifier2.py, which uses:
-REM      .env2      for credentials
-REM      debug2\    for screenshots, form dumps and run_log.csv
+REM  It uses:
+REM      .env2               for credentials
+REM      MASTER_RULES.md     the rulebook (project root)
+REM      debug2\             screenshots, form dumps, gpt_flow_log.csv
 REM
-REM  SYSTEM 1 is run.bat / website_verifier.py and is unaffected.
+REM  The portal + ChatGPT flow is System 2's only engine. Any
+REM  argument given here is passed straight through, so:
+REM      run2.bat                  portal + ChatGPT   (default)
+REM      run2.bat --login-only     log in and stop
+REM      run2.bat --chatgpt-login  one-time ChatGPT sign-in
+REM      run2.bat --dump-form      read-only form dump
+REM
+REM  The built-in crawler engine was removed from System 2 on
+REM  2026-09-05. It lives on in SYSTEM 1: automation1\run.bat and
+REM  automation1\website_verifier.py, which are unaffected.
 REM ==============================================================
 cd /d "%~dp0"
+
+set "MODE=%*"
+if "%MODE%"=="" set "MODE=--gpt-flow"
+
 echo Starting website verifier SYSTEM 2 from %cd%
+echo Mode: %MODE%
 echo.
-python "website_verifier2.py"
+python "website_verifier2.py" %MODE%
 echo.
 echo ==============================================================
 echo  SYSTEM 2 run finished. Press any key to close this window.

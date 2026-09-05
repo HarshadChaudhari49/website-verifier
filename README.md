@@ -5,13 +5,9 @@ logs into the work portal, reads the assigned URL, decides whether the site
 qualifies against a rulebook, submits the result, fetches the next URL, and
 repeats until stopped.
 
-System 2 has two engines:
-
-- **`--gpt-flow`** — drives ChatGPT in a second browser tab. The rulebook goes
-  in once, then each assigned URL is sent on its own and the verdict is read
-  back and submitted.
-- **default** — a self-contained crawler that inspects the site directly, with
-  no external service involved.
+Verification is done by ChatGPT, driven in a second browser tab: the rulebook
+goes in once, then each assigned URL is sent on its own and the verdict is read
+back and submitted to the portal.
 
 ## Requirements
 
@@ -38,14 +34,15 @@ The rulebook `MASTER_RULES.md` is read from the repository root at runtime.
 
 ```
 cd automation2
-python website_verifier2.py --gpt-flow     # portal + ChatGPT
-python website_verifier2.py                # built-in crawler engine
-python website_verifier2.py --login-only   # log in and stop
-python website_verifier2.py --dump-form    # read-only dump of the portal form
+python website_verifier2.py                  # portal + ChatGPT (default)
+python website_verifier2.py --gpt-flow       # the same, stated explicitly
+python website_verifier2.py --login-only     # log in and stop
+python website_verifier2.py --dump-form      # read-only dump of the portal form
 python website_verifier2.py --chatgpt-login  # one-time hand sign-in to ChatGPT
 ```
 
-`run2.bat` is a double-click launcher for the default engine.
+`run2.bat` is a double-click launcher; it defaults to the ChatGPT flow and
+forwards any flag you give it.
 
 `--gpt-flow` runs until you press Ctrl+C or close the browser window. It stays
 out of your way: no window is raised, and if you open the portal's Admin
