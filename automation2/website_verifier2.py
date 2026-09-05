@@ -2672,6 +2672,41 @@ def recover_portal_page(portal):
     return False
 
 
+def discard_fallback_profiles():
+    """
+    Delete the one-off browser profiles earlier runs fell back to.
+
+    Only ever called once the MAIN profile has opened successfully,
+    which proves nothing holds a lock and so no fallback is in use.
+    Each one is a full Firefox profile of 35-40 MB and none of them
+    carries a ChatGPT session, so keeping them buys nothing.
+    """
+    prefix = os.path.basename(CHATGPT_PROFILE_DIR) + "_"
+    parent = os.path.dirname(CHATGPT_PROFILE_DIR)
+    try:
+        entries = os.listdir(parent)
+    except Exception:
+        return
+
+    import shutil
+    removed = 0
+    for name in entries:
+        if not name.startswith(prefix):
+            continue
+        path = os.path.join(parent, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            shutil.rmtree(path)
+            removed += 1
+        except Exception:
+            # Still in use, or a file is held open. Leave it; it will
+            # be caught on a later run.
+            pass
+    if removed:
+        print(f"  cleaned up {removed} leftover one-off browser profile(s)")
+
+
 def portal_on_admin_console(portal):
     """True when the portal is showing its Admin Console listing."""
     try:
@@ -2812,6 +2847,11 @@ def gpt_flow_mode(playwright):
         context = playwright.firefox.launch_persistent_context(
             CHATGPT_PROFILE_DIR, headless=False,
         )
+        # The main profile opened, so nothing holds a lock on it and
+        # any one-off profiles left by earlier runs are dead weight.
+        # Three of them had accumulated to 118 MB before this cleanup
+        # existed.
+        discard_fallback_profiles()
     except Exception as exc:
         # A Firefox left running from an earlier run keeps parent.lock
         # held, and the profile cannot be reused while it does. Rather
