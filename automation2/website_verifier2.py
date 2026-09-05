@@ -210,18 +210,6 @@ PAID_BUSINESS_TYPES = [
 
 
 # ============================================================
-# COUNTRY ALIASES  ->  workbook key
-# ============================================================
-# The workbook lists some countries under names no website actually
-# writes -- "United States of America or USA", "China (Hong Kong
-# S.A.R.)", "Korea, South". Without these aliases a US site saying
-# "United States" matched nothing and the record was wrongly skipped
-# for Country Error. The alias only decides WHICH workbook row
-# applies; the row itself still decides Correct / Incorrect / Not
-# Working and the name to use.
-
-
-# ============================================================
 # PORTAL COUNTRY FILL NAMES
 # ============================================================
 # CONFIRMED USER INSTRUCTION (2026-09-02): where the workbook spells a
@@ -237,105 +225,6 @@ PORTAL_COUNTRY_FILL_NAMES = {
     "china (hong kong s.a.r.)": "China (Hong Kong S.A.R.)",
     "china (macau s.a.r.)": "China (Macau S.A.R.)",
 }
-
-
-# ============================================================
-# NON-PAID CATEGORIES (guideline section 3.2 / source PDF item 4)
-# ============================================================
-# General service-provider / uninteresting business categories.
-# These do not, by themselves, block the site -- they only prevent
-# it from being counted as one of the seven paid business types.
-
-
-# ============================================================
-# HARD-REJECTED / RESTRICTED CATEGORIES (guideline section 3.2)
-# ============================================================
-# If any of these are found, the site is rejected outright as
-# non-considerable, regardless of otherwise-paid business type.
-# Each category maps to a short human-readable rejection reason.
-
-
-# ============================================================
-# HOSTING / URL STRUCTURE REJECTIONS
-# ============================================================
-
-
-# ============================================================
-# IMAGE CONTENT RESTRICTIONS
-# ============================================================
-# Guideline: images are not allowed of Porn/Adult/Medicine/
-# Pharmaceutical/Food/Vegetable/Beverages/Weapons/Aircraft/
-# Aerospace/Ship/Marine/Chemical/Alcohol/Animal subject matter,
-# and diagrams/geometric/technical drawings never qualify.
-
-
-# ============================================================
-# DIRECTORY / THIRD-PARTY PAGES (do not establish business type)
-# ============================================================
-
-
-# ============================================================
-# COMPANY INFORMATION TABS / PAGES
-# ============================================================
-
-
-# ============================================================
-# DOWNLOAD / NON-HTML RESOURCES
-# ============================================================
-
-
-# ============================================================
-# NOISE / IRRELEVANT SECTIONS
-# ============================================================
-# Press releases, awards, CSR/ESG posts, careers, and legal pages
-# never establish business type, count as products, or qualify as
-# company profile. Skipping them entirely keeps the crawl budget on
-# pages that can actually move the decision and avoids the kind of
-# false-positive "product" match a press/awards page can otherwise
-# trigger.
-
-
-# ============================================================
-# PRODUCT / NON-PRODUCT TERMS
-# ============================================================
-
-
-# ============================================================
-# US STATE CODES
-# ============================================================
-
-
-# ============================================================
-# STATE-EXEMPT COUNTRY MENU ENTRIES
-# ============================================================
-# Per the guideline: for these menu entries, state/region does not
-# need to be checked -- only address and city are required.
-
-# Guideline (h): "County, Province, Region, Prefecture and Capital of
-# Country are accepted as State." The address parser was US-only, so
-# every Australian, Canadian, British and European site failed on City
-# Error however good it was. These tables fix the four most common
-# address shapes this work actually sees.
-
-
-# ============================================================
-# COUNTRY NAME LIST  (embedded from Country_Name_List.xlsx)
-# ============================================================
-# Authoritative source for country-name validation. Keyed by
-# lowercase country name as it appears in the workbook.
-#   status "Correct"      -> usable exactly as listed (display name)
-#   status "Incorrect"    -> must use correct_name instead
-#   status "Not Working"  -> country is not workable under this rule
-#
-# Do not override this table with a guessed alternative.
-
-
-# ============================================================
-# PORTAL ERROR FIELD REFERENCE  (embedded from Error_Details.xlsx)
-# ============================================================
-# Reference only -- documents what the portal treats as an error
-# for each mandatory field so the decision engine's checks line up
-# exactly with the portal's own validation.
 
 
 # ============================================================
@@ -362,65 +251,6 @@ def normalize_url(url):
 
 
 # ============================================================
-# EMAIL / PHONE / ADDRESS EXTRACTION
-# ============================================================
-
-
-# ============================================================
-# PHONE / MOBILE  --  guideline (g), implemented clause by clause
-# ============================================================
-# "Toll free, Free Phone, TF, Fax numbers are not considered ... If fax
-#  number and phone number are same then it is accepted. If toll free
-#  number/TF number/Free phone number and phone number are same then it
-#  is not accepted ... The numbers which are mentioned as Toll free
-#  shall be skipped."
-#
-# So the LABEL a number is published under decides its fate, not just
-# its digits:
-#   fax only                      -> rejected
-#   fax AND phone/tel/mobile      -> ACCEPTED (same number, both roles)
-#   toll-free label, any other    -> rejected even if also called Tel
-#   toll-free numbering range     -> rejected
-# A number with no label at all is still usable -- plenty of contact
-# pages print the number on its own line.
-
-
-# Freephone detection, rebuilt after a real site proved the first
-# version wrong: Adelaide's landline 08 8340 4111 was rejected because
-# stripping the trunk "0" left "883404111", which matched a North
-# American reserved 88x prefix. Country rules are now applied only
-# where they actually belong.
-
-
-# Many contact pages print the whole address on ONE line:
-#   "79-85 Cowpasture Road, Wetherill Park NSW 2164"
-#   "1200 Industrial Way, Cleveland, OH 44135"
-# The line-by-line parser could never see a city or state in those, so
-# every such site failed with City Error. These patterns read the
-# trailing city/state/postcode and treat whatever precedes it as the
-# street.
-
-
-# ============================================================
-# COUNTRY DETECTION & VALIDATION
-# ============================================================
-
-
-# ============================================================
-# RESTRICTED / NON-PAID CATEGORY DETECTION
-# ============================================================
-
-
-# ============================================================
-# LANGUAGE SWITCHING
-# ============================================================
-# Per guideline: a non-English site WITH a translation option is
-# still workable. Rather than only detecting that the option exists
-# (has_translation_option above), actively use it so the crawl
-# proceeds in English.
-
-
-# ============================================================
 # DIALOG HANDLING
 # ============================================================
 # Some portals show a native "Are you sure?" confirm dialog on
@@ -437,76 +267,6 @@ def install_dialog_autoaccept(page):
             except Exception:
                 pass
     page.on("dialog", _handle_dialog)
-
-
-# ============================================================
-# EVIDENCE SPLITTING
-# ============================================================
-
-
-# ============================================================
-# BUSINESS TYPE DETECTION
-# ============================================================
-
-
-# ============================================================
-# COMPANY PROFILE
-# ============================================================
-
-
-# ============================================================
-# PRODUCT PAGE DETECTION
-# ============================================================
-
-
-# ============================================================
-# IMAGE ANALYSIS
-# ============================================================
-
-
-# ============================================================
-# IMAGE SOURCE COLLECTION
-# ============================================================
-
-
-# ============================================================
-# PRODUCT INSPECTION
-# ============================================================
-
-
-# ============================================================
-# LINK DISCOVERY
-# ============================================================
-
-
-# ============================================================
-# PAGE INSPECTION
-# ============================================================
-
-
-# ============================================================
-# URL STRUCTURE CHECKS
-# ============================================================
-
-
-# ============================================================
-# WEBSITE CRAWL ORCHESTRATION -- STAGED
-# ============================================================
-#
-# The crawl is split into two independent stages so a site that is
-# going to fail an early, cheap check (restricted category, wrong
-# business type, missing email, bad country, etc.) never wastes time
-# hunting for products at all:
-#
-#   Stage 1 (crawl_context):  homepage + company-context/contact
-#     pages only. Fast, small page budget. Everything the pre-
-#     product decision checks need.
-#
-#   Stage 2 (crawl_products): only run if Stage 1 + the pre-product
-#     checks all pass. Hunts for qualifying products/services,
-#     stopping as soon as MIN_QUALIFYING_PRODUCTS distinct
-#     qualifying entries are found.
-# ============================================================
 
 
 # ============================================================
@@ -554,57 +314,8 @@ def get_assigned_url(portal):
 
 
 # ============================================================
-# DECISION ENGINE
-# ============================================================
-#
-# Implements the master guideline's decision-first rule: a website
-# is QUALIFIES only after every applicable mandatory requirement has
-# actually been verified. Any single missing/unclear/unverifiable
-# mandatory requirement forces SKIP. Checks are evaluated in the
-# guideline's own working order so the first failing checkpoint is
-# reported as the decision reason.
-# ============================================================
-
-
-# ============================================================
-# OUTPUT FORMATTING  (fixed by master guideline section 4)
-# ============================================================
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-# ============================================================
 # PORTAL SUBMISSION -- SKIP -> "Not Working" -> Submit
 # ============================================================
-#
-# CONFIRMED USER INSTRUCTION: on SKIP (any reason -- dead site OR a
-# guideline mismatch such as wrong business type, restricted
-# category, or a missing mandatory field) select "Not Working" in
-# the Website Status dropdown and submit the form, then continue
-# working the new URL the portal generates.
-#
-# NOTE ON ACCURACY: your own Master Guideline explicitly warns that
-# a working, loading site marked "Not Working" is counted as an
-# error ("if the delivery partner submits the data of unpaid
-# category by selecting working in the website status field...").
-# Most SKIP reasons here (wrong business type, restricted category,
-# missing email, etc.) occur on sites that load fine -- this setting
-# submits "Not Working" for those too, per your explicit instruction
-# overriding that default. Set AUTO_SUBMIT_SKIP_AS_NOT_WORKING to
-# False to fall back to read-only / manual mode at any time.
-#
-# NOTE ON SELECTORS: the exact field names on your live portal were
-# never provided and this script cannot browse your live portal to
-# discover them. The selector lists below are the most common
-# real-world naming patterns, tried in order (same strategy as
-# get_assigned_url). If NONE of them match your form, add the real
-# selector as the FIRST entry in the relevant list -- open your
-# browser's dev tools on the portal page, right-click the Website
-# Status dropdown -> Inspect, and copy its `name` or `id` attribute.
-# ============================================================
-
 
 WEBSITE_STATUS_SELECTOR_CANDIDATES = [
     "select#WebsiteStatus",
@@ -1165,25 +876,6 @@ def wait_for_new_assigned_url(portal, previous_url, attempts=8, reloads=2):
 # ============================================================
 # PORTAL SUBMISSION -- QUALIFIES -> auto-fill -> Submit
 # ============================================================
-#
-# CONFIRMED USER INSTRUCTION: when a site fully qualifies, fill the
-# verified data into the portal and submit it directly.
-#
-# The real portal column names come from Error_Details.xlsx ("Columns
-# of Portal": url, bussinesstype, country, emailid, phoneormobile,
-# address, city, state, companyprofile, productname, productimage,
-# productdescription) and are used as the FIRST selector candidate
-# for each field -- these are actual field names from your source
-# documents, not a guess. Generic fallback patterns are tried after
-# them in case the live form differs slightly.
-#
-# SAFETY RULE: this never submits a partially-filled record. If any
-# single mandatory field's selector cannot be located, the whole
-# attempt is aborted before anything is submitted, the record is
-# logged as needing manual entry, and the script moves on to the
-# next URL -- it will not guess a selector or submit incomplete data.
-# ============================================================
-
 # CONFIRMED against the live portal form dump. Every id/name below
 # was read off the real page, not guessed. Note the shapes, which are
 # NOT what was assumed before the dump:
@@ -1404,11 +1096,6 @@ def fill_and_submit_qualifies(portal, fields):
         f"Company Profile flags, and product counts ({verified_count})."
     )
     return True
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 
 # ============================================================
