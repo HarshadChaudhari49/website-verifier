@@ -860,8 +860,12 @@ def wait_for_new_assigned_url(portal, previous_url, attempts=8, reloads=2):
     decide what to do.
     """
     for round_index in range(reloads + 1):
-        for _ in range(attempts):
-            portal.wait_for_timeout(1000)
+        for attempt in range(attempts):
+            # Look first, then wait. The portal usually has the next
+            # URL ready immediately, and sleeping before the first
+            # check spent a second per record for nothing.
+            if attempt:
+                portal.wait_for_timeout(800)
             candidate = get_assigned_url(portal)
             if candidate and candidate != previous_url:
                 return candidate
@@ -938,6 +942,15 @@ QUALIFIES_FIELD_SELECTORS = {
 # The portal spells some business types differently from the
 # guidelines. Map ours onto the exact option label the dropdown
 # offers; anything not listed is passed through unchanged.
+#
+# DO NOT "CORRECT" THIS. Rulebook v3.1 rule BT-014 says: '"Distributor"
+# is valid. "Distributer" is not the accepted category spelling.' That
+# governs what ChatGPT must OUTPUT, and it does -- parse_gpt_qualifies()
+# accepts "Distributor" via PAID_BUSINESS_TYPES. But the live portal's
+# own <option> is spelled "Distributer" (confirmed in the form dump),
+# and select_option() has to match the portal exactly or the field is
+# left blank. So both are right: "Distributor" in, "Distributer" onto
+# the form.
 PORTAL_BUSINESS_TYPE_LABELS = {
     "Distributor": "Distributer",
 }
@@ -1964,6 +1977,39 @@ CHATGPT_PROGRESS_MARKERS = (
 )
 
 
+# How long an answer must sit unchanged before it counts as finished,
+# and how often to look. The quiet window only applies to answers that
+# can still grow -- see the fast path in _chatgpt_wait_for_reply().
+REPLY_QUIET_SECONDS = 5
+REPLY_POLL_SECONDS = 0.4
+
+# Scrolling queries every element under <main>, which gets expensive as
+# the conversation grows, so it does not need doing on every poll.
+SCROLL_EVERY_N_POLLS = 3
+
+
+def _chatgpt_is_definite_skip(body):
+    """
+    True when the answer is a rejection and cannot become anything else.
+
+    Deliberately strict: the text must START with SKIP and must not
+    carry any part of the QUALIFIES field block. An answer holding
+    both is left to the careful path, which reports UNCLEAR and
+    submits nothing.
+    """
+    text = (body or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in QUALIFIES_BLOCK_MARKERS):
+        return False
+    if "qualifies" in lowered:
+        return False
+    # Drop a leading glyph or bullet, then require SKIP first.
+    head = text.lstrip("-*#>■❌ ").upper()
+    return head.startswith("SKIP")
+
+
 def _chatgpt_is_progress(body):
     """True when the text is a progress indicator, not an answer."""
     text = (body or "").strip().lower().rstrip(".… ")
@@ -2058,6 +2104,7 @@ def _chatgpt_wait_for_reply(page, before_count, timeout=300,
     # The answer already on screen when the message was sent. A new
     # one is only new once it differs from this.
     previous_answer = _chatgpt_answer_body(baseline_text)
+    polls = 0
 
     while time.time() < deadline:
         gate = _chatgpt_gate(page)
@@ -2081,7 +2128,9 @@ def _chatgpt_wait_for_reply(page, before_count, timeout=300,
             # virtualises, the rendered text changes shape as it
             # scrolls, and the common-prefix comparison stopped
             # meaning anything.
-            _chatgpt_scroll_to_bottom(page)
+            polls += 1
+            if polls % SCROLL_EVERY_N_POLLS == 1:
+                _chatgpt_scroll_to_bottom(page)
             whole = _chatgpt_main_text(page)
 
             if sent_text and len(sent_text) <= 500:
@@ -2094,24 +2143,40 @@ def _chatgpt_wait_for_reply(page, before_count, timeout=300,
                 # and require it to differ from what was there before.
                 current = _chatgpt_answer_body(whole)
                 if previous_answer and current == previous_answer:
-                    time.sleep(1)
+                    time.sleep(REPLY_POLL_SECONDS)
                     continue
 
             if not current or _chatgpt_is_progress(current):
                 # Not an answer yet: only page furniture so far, or
                 # ChatGPT is still browsing.
-                time.sleep(1)
+                time.sleep(REPLY_POLL_SECONDS)
                 continue
+
+        # FAST PATH -- a bare SKIP is final the moment it appears.
+        #
+        # The rulebook requires a rejection to be exactly "SKIP" and
+        # nothing else, so there is nothing further to stream. Even
+        # when a reason does follow ("SKIP - Domain rule: ..."), the
+        # verdict is unchanged, and a SKIP answer can never turn into
+        # a QUALIFIES one: the two formats are mutually exclusive and
+        # a qualifying answer opens with "Email:". So waiting out the
+        # full quiet window here buys nothing and costs 5s on the
+        # ~95% of records that are rejections.
+        #
+        # Guarded: any field-block marker in the text means this is
+        # not a plain SKIP, and it falls through to the careful path.
+        if current and _chatgpt_is_definite_skip(current):
+            return current
 
         if current and current == last_text:
             if quiet_since is None:
                 quiet_since = time.time()
-            elif time.time() - quiet_since >= 5:
+            elif time.time() - quiet_since >= REPLY_QUIET_SECONDS:
                 return current
         else:
             last_text = current
             quiet_since = None
-        time.sleep(1)
+        time.sleep(REPLY_POLL_SECONDS)
 
     if last_text:
         print("    reply timed out mid-stream -- returning what arrived")
@@ -2200,7 +2265,28 @@ CHATGPT_RULES_PDF_NAME = "master doc for verification.pdf"
 # The master PDF converted to Markdown, at the project root. Preferred
 # over both the file and the raw PDF text -- see step 1 of
 # gpt_flow_mode() for why.
-MASTER_RULES_MD_NAME = "MASTER_RULES.md"
+# The rulebook sent to ChatGPT, newest version first. v3.1 is the
+# master document plus an incremental patch that tightens root-domain
+# control, business-type evidence, country inference, the three
+# independent product thresholds, and the image rules -- and it
+# preserves the whole original master inside itself, so it supersedes
+# rather than replaces.
+MASTER_RULES_CANDIDATES = (
+    "MASTER_RULES_v3.1.md",
+    "MASTER_RULES.md",
+)
+
+# Kept for the startup check and the "no rulebook" message.
+MASTER_RULES_MD_NAME = MASTER_RULES_CANDIDATES[0]
+
+
+def find_master_rules():
+    """The newest rulebook available, or "" if none is on disk."""
+    for name in MASTER_RULES_CANDIDATES:
+        path = project_file(name)
+        if path:
+            return path
+    return ""
 
 
 def read_text_file(path):
@@ -2436,6 +2522,35 @@ def gpt_portal_country(name):
     )
 
 
+# Answers that mean "this field is not there". Anything else printed
+# on one of the four Y/N lines is the verified value itself.
+GPT_FLAG_NEGATIVE_VALUES = {
+    "", "n", "no", "none", "n/a", "na", "nil", "null", "not found",
+    "not available", "not listed", "not published", "not provided",
+    "not mentioned", "missing", "absent", "unknown", "-", "--",
+}
+
+
+def gpt_flag_value_is_yes(value):
+    """
+    Read one of the four Y/N answer fields (Address, City, State,
+    Company Profile) from whatever the answer actually put on the line.
+
+    The master document specifies "Address: Y", but ChatGPT also prints
+    the verified value in its place -- "Address: Brandium Rezidans, ...
+    Istanbul", "Company Profile: <the profile text>". That is the same
+    assertion carrying its evidence. Reading it as N rejected a good
+    barelit.com answer and cost dunham-bush.com a paid record on
+    2026-09-06, which is what this exists to stop.
+
+    Nothing is inferred: an empty line, "N", "N/A" and "not found" all
+    still fail, so the governing rule holds -- a correct SKIP beats an
+    incorrect paid submission.
+    """
+    cleaned = clean(re.sub(r"^[\s\"'*#`]+|[\s\"'*#`.]+$", "", str(value or "")))
+    return cleaned.lower() not in GPT_FLAG_NEGATIVE_VALUES
+
+
 def parse_gpt_qualifies(answer):
     """
     Turn a QUALIFIES answer into the field dict
@@ -2462,9 +2577,10 @@ def parse_gpt_qualifies(answer):
     country_raw = grab(r"Country\s*:\s*([^\n]+)")
     business_raw = grab(r"Kind of Business\s*:\s*([^\n]+)")
 
-    # Two shapes are accepted, because both are in use: the master
-    # document's "Address: Y", and the "Address Y: <value>" form that
-    # answers were observed using.
+    # Three shapes are accepted, because all three are in use: the
+    # master document's "Address: Y", the "Address Y: <value>" form
+    # that answers were observed using, and the field's actual value
+    # printed in place of the Y -- see gpt_flag_value_is_yes().
     flags = {}
     for label, key in (
         ("Address", "address"),
@@ -2472,9 +2588,11 @@ def parse_gpt_qualifies(answer):
         ("State", "state"),
         ("Company Profile", "company_profile"),
     ):
+        value = grab(label + r"\s*:\s*([^\n]+)")
+        if value:
+            flags[key] = gpt_flag_value_is_yes(value)
+            continue
         match = re.search(label + r"\s*([YN])\s*:", text, re.I)
-        if not match:
-            match = re.search(label + r"\s*:\s*([YN])\b", text, re.I)
         flags[key] = bool(match and match.group(1).upper() == "Y")
 
     # Likewise for the product lines: "Product Name 3: ..." carries an
@@ -2809,13 +2927,13 @@ def feed_rulebook(gpt, who, rules):
     Put the rulebook into the current chat. Returns ChatGPT's
     acknowledgement, or "" if it never took.
 
-    Order: MASTER_RULES.md (the master PDF as Markdown) -> the PDF
-    file itself, only when signed in -> the PDF's raw text -> RULES.md.
+    Order: the newest MASTER_RULES file -> the PDF itself, only when
+    signed in -> the PDF's raw text -> RULES.md.
     """
     rules_pdf = find_rules_pdf()
     ack = ""
 
-    md_path = project_file(MASTER_RULES_MD_NAME)
+    md_path = find_master_rules()
     if md_path:
         md_text = read_text_file(md_path)
         if md_text:
@@ -2890,7 +3008,7 @@ def gpt_flow_mode(playwright):
     # wrong: the mode refused to start with MASTER_RULES.md present and
     # readable, purely because RULES.md had been moved into
     # automation1\.
-    md_available = project_file(MASTER_RULES_MD_NAME)
+    md_available = find_master_rules()
     pdf_available = find_rules_pdf()
     rules = read_rules_document()
     if not (md_available or pdf_available or rules):
@@ -3103,26 +3221,49 @@ def gpt_flow_mode(playwright):
             if verdict == "QUALIFIES":
                 fields = parse_gpt_qualifies(answer)
                 if not fields:
-                    # QUALIFIES with an unreadable field block is the
-                    # one case that must never be submitted: a wrong
-                    # SKIP costs one unpaid record, a wrong Working is
-                    # a paid submission of unverified data. Ask again
-                    # in a clean chat rather than submitting a guess.
-                    print("  nothing submitted -- the record stays assigned.")
-                    log_gpt_flow(
-                        assigned, verdict, "not submitted (fields incomplete)",
-                    )
-                    restart_chat(gpt, who, rules)
-                    continue
-                print("  fields read from the answer:")
-                print(f"    Email             {fields['email']}")
-                print(f"    Phone             {fields['phone']}")
-                print(f"    Country           {fields['country_fill']}")
-                print(f"    Kind of Business  {fields['business_type']}")
-                print("    Address/City/State/Profile  Y/Y/Y/Y")
-                print(f"    Products          {fields['product_count']}/3")
-                action = "QUALIFIES -> Working"
-                outcome = "submitted Working"
+                    # QUALIFIES with an unreadable field block is never
+                    # submitted as Working: a wrong SKIP costs one
+                    # unpaid record, a wrong Working is a paid
+                    # submission of unverified data.
+                    #
+                    # First time, ask again in a clean chat -- the
+                    # answer may have been garbled.
+                    #
+                    # Second time, the field really is unavailable, and
+                    # asking a third time just gets the same answer. A
+                    # masked email is the usual cause: sites behind
+                    # Cloudflare render "[email protected]" instead of
+                    # an address, and 15.1 forbids submitting a masked
+                    # one while GATE-003 makes an unverifiable
+                    # mandatory field a SKIP. So it goes in as Not
+                    # Working rather than looping to the 12-attempt
+                    # backoff.
+                    if attempts < 2:
+                        print("  nothing submitted -- retrying in a fresh chat.")
+                        log_gpt_flow(
+                            assigned, verdict,
+                            "not submitted (fields incomplete)",
+                        )
+                        restart_chat(gpt, who, rules)
+                        continue
+
+                    print("  the field block is still incomplete on attempt "
+                          f"{attempts} -- a mandatory field cannot be")
+                    print("  verified, which the rulebook makes a SKIP.")
+                    verdict = "SKIP"
+                    fields = None
+                    action = "QUALIFIES-but-unverifiable -> Not Working"
+                    outcome = "submitted Not Working (fields unverifiable)"
+                else:
+                    print("  fields read from the answer:")
+                    print(f"    Email             {fields['email']}")
+                    print(f"    Phone             {fields['phone']}")
+                    print(f"    Country           {fields['country_fill']}")
+                    print(f"    Kind of Business  {fields['business_type']}")
+                    print("    Address/City/State/Profile  Y/Y/Y/Y")
+                    print(f"    Products          {fields['product_count']}/3")
+                    action = "QUALIFIES -> Working"
+                    outcome = "submitted Working"
             elif verdict == "SKIP":
                 fields = None
                 action = "SKIP -> Not Working"
