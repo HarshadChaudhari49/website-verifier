@@ -1315,6 +1315,16 @@ def _chatgpt_type_first(page, selectors, value, what, timeout=25000):
     never updates, so Continue submits an empty form and the page just
     re-renders itself. That exact false negative was observed here --
     the email appeared to be entered and the form came back blank.
+
+    Typing is then VERIFIED, because it can silently lose the tail of
+    the value: "vickygood2990@gmail.com" arrived as "vickygood2990@"
+    on 2026-09-07 when the input remounted mid-typing, and the form
+    answered "Email is not valid" with no password step -- which reads
+    exactly like a wrong credential or an SSO-only account. Anything
+    short is repaired with the native value setter, the same technique
+    the composer uses and the one React does respond to.
+
+    The value is never printed; only how much of it landed.
     """
     selector = _chatgpt_wait_for_any(page, selectors, what, timeout=timeout)
     if not selector:
@@ -1324,12 +1334,44 @@ def _chatgpt_type_first(page, selectors, value, what, timeout=25000):
         target = page.locator(selector).first
         target.click(timeout=4000)
         target.press_sequentially(value, delay=60, timeout=15000)
-        print(f"    typed {what} into {selector}")
-        return True
     except Exception as exc:
         print(f"    {what} field {selector} would not accept input "
               f"({type(exc).__name__})")
         return False
+
+    landed = _chatgpt_input_value(page, selector)
+    if landed != value:
+        print(f"    only {len(landed)}/{len(value)} characters of the "
+              f"{what} landed -- repairing with the native setter")
+        _chatgpt_set_composer_text(page, selector, value)
+        landed = _chatgpt_input_value(page, selector)
+    if landed != value:
+        print(f"    {what} field {selector} would not hold the value "
+              f"({len(landed)}/{len(value)} characters)")
+        return False
+
+    print(f"    typed {what} into {selector}")
+    return True
+
+
+def _chatgpt_input_value(page, selector):
+    """
+    What the field actually contains right now, or "" if it cannot be
+    read. Used to check that typing landed in full -- never printed.
+    """
+    try:
+        return page.evaluate(
+            """
+            (sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return "";
+                return el.isContentEditable ? el.textContent : el.value;
+            }
+            """,
+            selector,
+        ) or ""
+    except Exception:
+        return ""
 
 
 def _chatgpt_session_user(page):
