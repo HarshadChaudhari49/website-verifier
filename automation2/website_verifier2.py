@@ -1315,16 +1315,6 @@ def _chatgpt_type_first(page, selectors, value, what, timeout=25000):
     never updates, so Continue submits an empty form and the page just
     re-renders itself. That exact false negative was observed here --
     the email appeared to be entered and the form came back blank.
-
-    Typing is then VERIFIED, because it can silently lose the tail of
-    the value: "vickygood2990@gmail.com" arrived as "vickygood2990@"
-    on 2026-09-07 when the input remounted mid-typing, and the form
-    answered "Email is not valid" with no password step -- which reads
-    exactly like a wrong credential or an SSO-only account. Anything
-    short is repaired with the native value setter, the same technique
-    the composer uses and the one React does respond to.
-
-    The value is never printed; only how much of it landed.
     """
     selector = _chatgpt_wait_for_any(page, selectors, what, timeout=timeout)
     if not selector:
@@ -1334,44 +1324,12 @@ def _chatgpt_type_first(page, selectors, value, what, timeout=25000):
         target = page.locator(selector).first
         target.click(timeout=4000)
         target.press_sequentially(value, delay=60, timeout=15000)
+        print(f"    typed {what} into {selector}")
+        return True
     except Exception as exc:
         print(f"    {what} field {selector} would not accept input "
               f"({type(exc).__name__})")
         return False
-
-    landed = _chatgpt_input_value(page, selector)
-    if landed != value:
-        print(f"    only {len(landed)}/{len(value)} characters of the "
-              f"{what} landed -- repairing with the native setter")
-        _chatgpt_set_composer_text(page, selector, value)
-        landed = _chatgpt_input_value(page, selector)
-    if landed != value:
-        print(f"    {what} field {selector} would not hold the value "
-              f"({len(landed)}/{len(value)} characters)")
-        return False
-
-    print(f"    typed {what} into {selector}")
-    return True
-
-
-def _chatgpt_input_value(page, selector):
-    """
-    What the field actually contains right now, or "" if it cannot be
-    read. Used to check that typing landed in full -- never printed.
-    """
-    try:
-        return page.evaluate(
-            """
-            (sel) => {
-                const el = document.querySelector(sel);
-                if (!el) return "";
-                return el.isContentEditable ? el.textContent : el.value;
-            }
-            """,
-            selector,
-        ) or ""
-    except Exception:
-        return ""
 
 
 def _chatgpt_session_user(page):
@@ -1857,6 +1815,29 @@ CHATGPT_GATE_MARKERS = (
     "create an account to continue",
 )
 
+# The "Message limit reached" dialog. An anonymous chat has a low cap;
+# once it is hit the send button still clicks and the answer simply
+# never arrives, which reads exactly like a wedged composer. The cap is
+# per CONVERSATION, so the dialog's own "New chat" option clears it --
+# observed 2026-09-07, where try 3 of the rulebook went through on a
+# new chat after two refusals.
+CHATGPT_LIMIT_MARKERS = (
+    "message limit reached",
+    "reached the anonymous message limit",
+    "reached our limit of messages",
+    "you've reached your limit",
+)
+
+# "New chat" inside that dialog first, then the sidebar's own New chat.
+# Either lands in an empty conversation; the dialog's button is
+# preferred because it needs no navigation.
+CHATGPT_NEW_CHAT_SELECTORS = (
+    '[role="dialog"] button:has-text("New chat")',
+    '[role="dialog"] a:has-text("New chat")',
+    'button:has-text("New chat")',
+    'a[href="/"]:has-text("New chat")',
+)
+
 
 def read_rules_document():
     """RULES.md as text -- the rulebook CLAUDE.md names as authoritative."""
@@ -2029,6 +2010,49 @@ REPLY_POLL_SECONDS = 0.4
 # the conversation grows, so it does not need doing on every poll.
 SCROLL_EVERY_N_POLLS = 3
 
+# How often the reply wait looks for the message-limit dialog. Every
+# 5th poll is roughly every 2s: fast enough that a capped chat is
+# caught almost immediately, rare enough not to cost reading the page
+# text on every single poll.
+LIMIT_CHECK_EVERY_N_POLLS = 5
+
+
+# Every line the master document's field block requires. The block has
+# finished streaming only once all of them carry a value.
+QUALIFIES_REQUIRED_LABELS = (
+    r"Email",
+    r"Phone(?:\s*(?:No|Number)\.?)?",
+    r"Country",
+    r"Kind of Business",
+    r"Address",
+    r"City",
+    r"State",
+    r"Company Profile",
+    r"3\+\s*(?:Physical\s*)?Products?",
+    r"3\+\s*Product Images?",
+    r"3\+\s*Product Descriptions?",
+)
+
+
+def _chatgpt_is_complete_qualifies(body):
+    """
+    True when every line of the QUALIFIES field block has arrived with
+    a value, so there is nothing left to wait for.
+
+    Deliberately strict. A block still streaming fails here -- the
+    field currently arriving has no value yet -- and falls through to
+    the quiet window, which is what protects a paid submission from
+    being read half-written. The "Address Y: <value>" variant also
+    fails and takes the careful path; slower is the safe direction.
+    """
+    text = re.sub(r"[*#`]", "", body or "")
+    if "@" not in text:
+        return False
+    for label in QUALIFIES_REQUIRED_LABELS:
+        if not re.search(label + r"\s*:\s*\S", text, re.I):
+            return False
+    return True
+
 
 def _chatgpt_is_definite_skip(body):
     """
@@ -2147,12 +2171,27 @@ def _chatgpt_wait_for_reply(page, before_count, timeout=300,
     # one is only new once it differs from this.
     previous_answer = _chatgpt_answer_body(baseline_text)
     polls = 0
+    limit_polls = 0
 
     while time.time() < deadline:
         gate = _chatgpt_gate(page)
         if gate:
             print(f"    chatgpt.com is refusing: {gate!r}")
             return ""
+
+        # The message-limit dialog means the answer is never coming.
+        # Checked HERE, in the poll loop, and not only after this
+        # function times out: the dialog is on screen the instant the
+        # cap is hit, and waiting out the full 300s first burned five
+        # minutes per record before the recovery could even start.
+        # Its wording is not in CHATGPT_GATE_MARKERS, so the gate
+        # check above walks straight past it.
+        if limit_polls % LIMIT_CHECK_EVERY_N_POLLS == 0:
+            limit = chatgpt_message_limit(page)
+            if limit:
+                print(f"    ChatGPT reports: {limit}")
+                return ""
+        limit_polls += 1
 
         texts = _chatgpt_assistant_texts(page)
         if len(texts) > before_count:
@@ -2208,6 +2247,17 @@ def _chatgpt_wait_for_reply(page, before_count, timeout=300,
         # Guarded: any field-block marker in the text means this is
         # not a plain SKIP, and it falls through to the careful path.
         if current and _chatgpt_is_definite_skip(current):
+            return current
+
+        # SECOND FAST PATH -- a field block that is already complete.
+        #
+        # Every required line has arrived with a value, and the master
+        # document allows nothing after the block, so the quiet window
+        # can only re-read the same text. A half-streamed block fails
+        # this check (a field still arriving has no value yet) and
+        # still goes the careful way, which is what protects the paid
+        # submission.
+        if current and _chatgpt_is_complete_qualifies(current):
             return current
 
         if current and current == last_text:
@@ -2778,7 +2828,11 @@ def wait_for_portal_record_ready(portal, expected_url, timeout=40):
 
         if time.time() >= deadline:
             return "timeout"
-        time.sleep(1)
+        # 0.3s, not 1s: this runs once per record and the form is
+        # usually ready within a fraction of a second of being asked.
+        # The deadline is unchanged, so a genuinely slow page still
+        # gets its full wait.
+        time.sleep(0.3)
 
 
 def log_gpt_flow(assigned, verdict, outcome):
@@ -2828,7 +2882,9 @@ def recover_portal_page(portal):
                 return True
         except Exception:
             pass
-        time.sleep(1)
+        # See wait_for_portal_record_ready: a tighter poll, the same
+        # deadline.
+        time.sleep(0.3)
     return False
 
 
@@ -3008,6 +3064,48 @@ def feed_rulebook(gpt, who, rules):
     return ack
 
 
+def chatgpt_message_limit(page):
+    """
+    The message-limit text showing on the page, or None.
+
+    Worth checking before blaming the composer: at the cap the send
+    button still clicks and the reply never comes, so a limited chat
+    and a wedged one look identical in the log.
+    """
+    text = _chatgpt_page_text(page, timeout=4000)
+    for marker in CHATGPT_LIMIT_MARKERS:
+        if marker in text:
+            return marker
+    return None
+
+
+def chatgpt_new_chat_from_limit(page):
+    """
+    Take the limit dialog's own "New chat" option, and confirm the
+    dialog actually went away. True only if it did.
+
+    Clicking is not enough to report success: the modal can stay up
+    when the click lands on its backdrop, and a chat that still holds
+    the dialog cannot be fed the rulebook.
+    """
+    for selector in CHATGPT_NEW_CHAT_SELECTORS:
+        try:
+            target = page.locator(selector).first
+            if not target.is_visible(timeout=2000):
+                continue
+            target.click(timeout=5000)
+        except Exception:
+            continue
+        try:
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+        if not chatgpt_message_limit(page):
+            print(f"    took 'New chat' from the dialog: {selector}")
+            return True
+    return False
+
+
 def restart_chat(gpt, who, rules):
     """
     Open a brand-new chat and load the rulebook into it.
@@ -3016,13 +3114,31 @@ def restart_chat(gpt, who, rules):
     a wedged composer, an answer that never arrives, a reply that
     cannot be read. Cheaper than ending the run and starting over by
     hand, which is what used to happen.
+
+    At the message limit the dialog's own "New chat" option is taken
+    first: the cap is per conversation, so a new chat clears it, and
+    that route needs no navigation. The rulebook then goes into the
+    new chat exactly as it does at startup, and the record is retried
+    there -- the instructed recovery, 2026-09-07.
     """
     print("  starting a fresh chat and re-loading the rulebook")
-    try:
-        gpt.goto(CHATGPT_HOME_URL, wait_until="domcontentloaded", timeout=40000)
-    except Exception as exc:
-        print(f"  could not open a new chat ({type(exc).__name__})")
-        return False
+
+    limit = chatgpt_message_limit(gpt)
+    took_dialog = False
+    if limit:
+        print(f"  ChatGPT reports: {limit}")
+        took_dialog = chatgpt_new_chat_from_limit(gpt)
+        if not took_dialog:
+            print("    the dialog's 'New chat' did not take -- navigating")
+
+    if not took_dialog:
+        try:
+            gpt.goto(
+                CHATGPT_HOME_URL, wait_until="domcontentloaded", timeout=40000,
+            )
+        except Exception as exc:
+            print(f"  could not open a new chat ({type(exc).__name__})")
+            return False
 
     if _chatgpt_bot_wall(gpt):
         print("  a bot check is in the way of the new chat.")
@@ -3247,8 +3363,18 @@ def gpt_flow_mode(playwright):
             # contradict it.
             answer = chatgpt_send_message(gpt, assigned, "assigned URL")
             if not answer:
-                print("  no answer from ChatGPT -- nothing submitted.")
-                print("  restarting the chat and trying this record again.")
+                # Name the message limit when that is what happened.
+                # Otherwise it is logged as a silent composer, and the
+                # real cause -- a conversation at its cap -- is
+                # invisible in the terminal.
+                limit = chatgpt_message_limit(gpt)
+                if limit:
+                    print(f"  ChatGPT hit its message limit: {limit}")
+                    print("  taking a new chat, re-loading the rulebook, and")
+                    print("  trying this record there. Nothing submitted.")
+                else:
+                    print("  no answer from ChatGPT -- nothing submitted.")
+                    print("  restarting the chat and trying this record again.")
                 _chatgpt_shot(gpt, "gptflow_no_verdict")
                 restart_chat(gpt, who, rules)
                 continue

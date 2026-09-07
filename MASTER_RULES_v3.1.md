@@ -246,6 +246,12 @@ Country Entry Status Correct Name China Not Working Congo, Democratic Republic o
 
 \- Facebook may be used for address/email/number when the source guideline permits it; if the Facebook page also has the number, use the number too.
 
+\- CONTROLLING SOURCE TEXT — guideline (g), Phone / Mobile, quoted verbatim. Where anything above is narrower or broader than this wording, this wording governs:
+
+g) Phone, Mobile: Should match the ones present on original website. Toll free, Free Phone, TF, Fax numbers are not considered. Please fill the Phone no. / Mobile no. available at website without copying special character. If phone no. box is set blank, then it will be treated as an error. If fax number and phone number are same then it is accepted. If toll free number/TF number/Free phone number and phone number are same then it is not accepted. (Criteria are to fill the phone no./ mob.No. if it’s a Paid type\*). Toll free numbers are not allowed to be used while completing the form. The numbers which are mentioned as Toll free shall be skipped by the delivery partner. All details have to be taken from the same place. Email, Number, Address, State.
+
+\- The last two sentences apply to the whole contact block, not only to the phone: Email, Number, Address and State must all come from the same place. A number taken from one branch and an address from another fails this rule even when each is individually correct.
+
 **## 11. PRODUCT VALIDATION SYSTEM**
 
 \- Minimum count is 3 distinct products.
