@@ -1831,11 +1831,19 @@ CHATGPT_LIMIT_MARKERS = (
 # "New chat" inside that dialog first, then the sidebar's own New chat.
 # Either lands in an empty conversation; the dialog's button is
 # preferred because it needs no navigation.
+#
+# The sidebar control was READ OFF the live page, not guessed:
+#     <a data-testid="create-new-chat-button" href="/">New chat</a>
+# The test-id goes first because it is the site's own handle and
+# survives copy changes; the text and href variants stay behind it in
+# case the id is renamed. A probe found the id present twice (the
+# sidebar link and its keyboard-shortcut twin), so .first matters.
 CHATGPT_NEW_CHAT_SELECTORS = (
     '[role="dialog"] button:has-text("New chat")',
     '[role="dialog"] a:has-text("New chat")',
-    'button:has-text("New chat")',
+    '[data-testid="create-new-chat-button"]',
     'a[href="/"]:has-text("New chat")',
+    'button:has-text("New chat")',
 )
 
 
