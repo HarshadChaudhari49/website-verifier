@@ -54,3 +54,25 @@ venv/
 .idea/
 Thumbs.db
 desktop.ini
+
+# System 3 -- same rules as Systems 1 and 2.
+.env3
+.env3.bak
+**/.env3
+**/.env3.bak
+chatgpt_profile3/
+chatgpt_profile3_*/
+**/chatgpt_profile3/
+**/chatgpt_profile3_*/
+
+# System 3 -- Chrome profiles (combined build, 2026-09-08).
+chatgpt_profiles/
+**/chatgpt_profiles/
+portal_chrome_profile3/
+**/portal_chrome_profile3/
+
+# System 3 debug output and local backups -- debug/ and debug2/ were
+# already ignored, debug3/ was missed.
+debug3/
+**/debug3/
+*.bak

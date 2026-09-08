@@ -1,27 +1,31 @@
 """
 Website Qualification & Verification Engine
 =============================================
-SYSTEM 2 -- SECOND COPY, for trying a different login or a
-different automation approach. It is deliberately independent of
-website_verifier.py:
-    credentials  ->  .env2      (not .env)
-    debug output ->  debug2/    (not debug/)
-Edit LOGIN_URL below if this system points at a different portal.
-Changes made here do NOT affect website_verifier.py.
+SYSTEM 3 -- the CHROME system.
+
+Built 2026-09-08 by combining two things:
+  * the proven portal + ChatGPT engine from System 2, and
+  * the Chrome sign-in approach that actually works (see
+    chatgpt_login_mode below -- it is the reason this file exists).
+
+It is deliberately independent of the other two systems:
+    credentials     ->  .env3               (not .env, not .env2)
+    debug output    ->  debug3/             (not debug/, not debug2/)
+    ChatGPT session ->  chatgpt_profiles/   (its own)
+    portal session  ->  portal_chrome_profile3/
+Changes made here do NOT affect System 1 or System 2.
 =============================================
 
-Automated Playwright-based crawler that verifies whether an assigned
+Automated Playwright-based engine that verifies whether an assigned
 website qualifies for the Copy & Paste website-evaluation workflow.
-
-This script implements the controlling rules from:
-  - Website_Qualification_Verification_MASTER_Guidelines_UPDATED.pdf
-  - Intensecore_Guidelines___Rules_New.pdf
-  - Country_Name_List.xlsx   (embedded below as COUNTRY_TABLE)
-  - Error_Details.xlsx       (embedded below as PORTAL_ERROR_FIELDS)
+The verification itself is done by ChatGPT against the master
+rulebook; this script drives the portal and the chat.
 
 CONTROLLING PRINCIPLES
 -----------------------
-1. Firefox only (never Chrome / an auto-translating browser).
+1. CHROME, and the sign-in is done in a NORMAL Chrome window rather
+   than an automated one. See the CHATGPT SESSION section for why --
+   this is the single decision the whole system depends on.
 2. The assigned website URL is read dynamically from the portal.
    No target URL is ever hardcoded.
 3. SUBMISSION BEHAVIOR (by explicit user instruction, overriding
@@ -29,25 +33,24 @@ CONTROLLING PRINCIPLES
      - On SKIP, the script selects Website Status = "Not Working"
        and submits the form, then picks up whatever new assigned
        URL the portal generates and continues automatically. This
-       applies to EVERY SKIP reason, not only genuinely dead sites
-       -- see the warning above AUTO_SUBMIT_SKIP_AS_NOT_WORKING.
-     - On QUALIFIES, nothing is auto-submitted. The verified fields
-       are printed for manual entry, since the portal's qualifying-
-       record field selectors were never supplied.
-     - Set AUTO_SUBMIT_SKIP_AS_NOT_WORKING = False to fall back to
-       fully read-only / manual mode at any time.
+       applies to EVERY SKIP reason, not only genuinely dead sites.
+     - On QUALIFIES, every field is filled and the record is
+       submitted with Website Status = "Working".
 4. QUALIFIES is returned only when every mandatory requirement has
    actually been verified. A single missing/unclear/unverifiable
    mandatory requirement forces the final result to SKIP.
 5. Never guess, invent, mask, or placeholder any value. Missing
    mandatory data is always a SKIP, never a fabricated answer.
 6. Output format is fixed by the master guideline (section 4):
-     - SKIP result   -> print exactly:  SKIP #
-     - QUALIFIES     -> print the exact field block described in
-       `print_final_qualifies()` below.
+     - SKIP result   -> exactly:  SKIP
+     - QUALIFIES     -> the exact field block, parsed back by
+       parse_gpt_qualifies().
 
 Run:
-    python website_verifier.py
+    python website_verifier3.py                  portal + ChatGPT
+    python website_verifier3.py --chatgpt-login  one-time sign-in
+    python website_verifier3.py --login-only     portal login, stop
+    python website_verifier3.py --dump-form      read-only form dump
 """
 
 from __future__ import annotations
@@ -55,16 +58,12 @@ from __future__ import annotations
 import io
 import os
 import re
+import subprocess
 import sys
 import time
-from collections import deque
-from urllib.parse import urljoin, urlparse
-from re import error
+from urllib.parse import urlparse
 
-from playwright.sync_api import (
-    TimeoutError as PlaywrightTimeoutError,
-    sync_playwright,
-)
+from playwright.sync_api import sync_playwright
 
 # The Windows console is cp1252 by default, and a ChatGPT reply
 # containing one "->" arrow crashed an otherwise finished run at the
@@ -77,7 +76,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 # ============================================================
-# PORTAL / CRAWL CONFIGURATION
+# PORTAL CONFIGURATION
 # ============================================================
 
 def script_dir():
@@ -93,10 +92,10 @@ def project_file(name):
     Find a shared project file. Looked for next to this script first,
     then one level up.
 
-    The parent lookup is what lets RULES.md and the master PDF live
-    once at the project root while System 1 and System 2 sit in their
-    own folders -- one copy, so the two systems can never drift onto
-    different versions of the rules.
+    The parent lookup is what lets the rulebook live once at the
+    project root while each system sits in its own folder -- one copy,
+    so the systems can never drift onto different versions of the
+    rules.
     """
     here = script_dir()
     for candidate in (
@@ -111,10 +110,10 @@ def project_file(name):
 def debug_path(filename):
     """
     Full path for a debug artefact (screenshots, form dumps). They are
-    kept in automation/debug/ so they never scatter across whatever
-    folder the script happened to be launched from.
+    kept in debug3/ so they never scatter across whatever folder the
+    script happened to be launched from.
     """
-    folder = os.path.join(script_dir(), "debug2")
+    folder = os.path.join(script_dir(), "debug3")
     try:
         if not os.path.isdir(folder):
             os.makedirs(folder)
@@ -167,21 +166,34 @@ LOGIN_URL = (
     "http://copypaste.dataevaluation.co.in/Account/Login?ReturnUrl=%2F"
 )
 
-# Read-only diagnostic mode:  python website_verifier.py --dump-form
+# Read-only diagnostic mode:  python website_verifier3.py --dump-form
 # Logs in, writes every field name / dropdown option on the record
-# page to debug/portal_form_debug.txt plus a screenshot, and exits.
+# page to debug3/portal_form_debug_*.txt plus a screenshot, and exits.
 # Nothing is filled, clicked or submitted, so it is always safe to
-# run against live work. This is what unblocks the three open items
-# in CLAUDE.md (product rows, Business Type, supplier-with-0-products).
+# run against live work.
 DUMP_FORM_ONLY = "--dump-form" in sys.argv[1:]
 
-# ChatGPT login mode (SYSTEM 2 only):
-#     python website_verifier2.py --chatgpt-login
-# Logs into chatgpt.com with CHATGPT_EMAIL / CHATGPT_PASSWORD from
-# .env2 and exits. The portal loop never runs in this mode.
+# ChatGPT login mode:
+#     python website_verifier3.py --chatgpt-login
+# Opens a NORMAL Chrome window for a one-time hand sign-in, then
+# verifies the saved session. The portal loop never runs in this mode.
 CHATGPT_LOGIN_ONLY = "--chatgpt-login" in sys.argv[1:]
 
-# Portal login only:  python website_verifier2.py --login-only
+# Which saved ChatGPT profile to use:
+#     python website_verifier3.py --chatgpt-profile work
+# Lets several ChatGPT accounts live side by side under
+# chatgpt_profiles/, so a second account can be signed in without
+# disturbing the first.
+CHATGPT_PROFILE_NAME = "default"
+for _arg_index, _arg in enumerate(sys.argv[1:-1]):
+    if _arg == "--chatgpt-profile":
+        CHATGPT_PROFILE_NAME = sys.argv[_arg_index + 2]
+        break
+CHATGPT_PROFILE_NAME = re.sub(
+    r"[^A-Za-z0-9._-]", "_", CHATGPT_PROFILE_NAME,
+).strip("._") or "default"
+
+# Portal login only:  python website_verifier3.py --login-only
 # Logs into the copy-paste portal exactly as a normal run does, then
 # stops and holds the window open. No record is read, filled, clicked
 # or submitted, so it is safe to run against live work.
@@ -396,8 +408,8 @@ def dump_portal_form(portal, note=""):
     """
     Write every form control currently on the portal page (tag, type,
     id, name, visible label/value, and every <select>'s options) to
-    portal_form_debug.txt, plus a full-page screenshot. Called when an
-    automatic submission cannot find a field, so the exact selector
+    portal_form_debug_*.txt, plus a full-page screenshot. Called when
+    an automatic submission cannot find a field, so the exact selector
     can be fixed instead of guessing again. Never raises.
     """
     try:
@@ -794,7 +806,7 @@ def ensure_logged_in(portal):
         print(
             "  The portal has logged us out and no credentials are "
             "available to log back in. Put PORTAL_USERNAME and "
-            "PORTAL_PASSWORD in .env."
+            "PORTAL_PASSWORD in .env3."
         )
         return False
 
@@ -891,8 +903,7 @@ def wait_for_new_assigned_url(portal, previous_url, attempts=8, reloads=2):
 #   productname / productimage / productdescription
 #                       dropdowns, counts 0 / 1 / 2 / 3 only
 # So the portal never wants product names, image files or description
-# text -- only how many of each were verified, capped at 3. That is
-# what closes the old "product rows are manual" open item.
+# text -- only how many of each were verified, capped at 3.
 QUALIFIES_FIELD_SELECTORS = {
     "email": [
         "input#emailid1", "input[name='emailid1']",
@@ -1003,8 +1014,8 @@ def fill_and_submit_qualifies(portal, fields):
         productname/productimage/productdescription -> count, 0-3
 
     Product entry is a count, not a row of names/images/descriptions,
-    so a qualifying record is now fully automatic -- nothing about it
-    is left for manual entry.
+    so a qualifying record is fully automatic -- nothing about it is
+    left for manual entry.
 
     Returns True only if every mandatory field was located, filled,
     AND the submit button was found and clicked. On any failure,
@@ -1042,7 +1053,7 @@ def fill_and_submit_qualifies(portal, fields):
         portal, QUALIFIES_FIELD_SELECTORS["phone"], fields["phone"],
     )
     # Country is a plain text input on this portal, not a dropdown.
-    # USA / UK / the China (… S.A.R.) menu entries per the user's
+    # USA / UK / the China (... S.A.R.) menu entries per the user's
     # instruction; otherwise the workbook's own validated name.
     country_to_fill = fields.get("country_fill") or fields["country"]
     filled["country"] = _fill_text_field(
@@ -1112,52 +1123,59 @@ def fill_and_submit_qualifies(portal, fields):
 
 
 # ============================================================
-# CHATGPT SESSION  (SYSTEM 2 ONLY)
+# CHATGPT SESSION  -- THE KEY DESIGN DECISION
 # ============================================================
-#     python website_verifier2.py --chatgpt-login
+#     python website_verifier3.py --chatgpt-login
 #
-# WHY THIS IS NOT A PASSWORD LOGIN -- measured on 2026-09-03, not
-# guessed:
+# THE SIGN-IN NEVER HAPPENS IN AN AUTOMATED BROWSER. That single
+# sentence is why this system works, and it is not a guess -- it was
+# measured against the alternative on 2026-09-08.
 #
-#   * chatgpt.com/auth/login accepts the email fine. But the account
-#     in .env2 is a GOOGLE-LINKED account, so OpenAI never asks for a
-#     password of its own -- Continue redirects to
-#     accounts.google.com/v3/signin/identifier.
-#   * Google then refuses a scripted browser outright. It lands on
-#     accounts.google.com/v3/signin/rejected with "This browser or app
-#     may not be secure -- try using a different browser". The
-#     password box is never shown, so the password in .env2 can never
-#     be entered. This is Google's anti-automation control, and
-#     nothing in this file tries to defeat it.
+# WHAT DOES NOT WORK: driving Google's sign-in from Playwright.
+#   * chatgpt.com/auth/login accepts the email fine, but a
+#     GOOGLE-LINKED account never gets an OpenAI password box -- it
+#     hands off to accounts.google.com.
+#   * On Firefox, Google refused outright: "This browser or app may
+#     not be secure".
+#   * On Playwright-driven Chrome it is subtler and worse. Google DOES
+#     show its ordinary sign-in form and accepts the email, then
+#     silently returns to chatgpt.com with NO session and NO error to
+#     read. Better selectors and longer timeouts cannot fix that: the
+#     problem is not the clicking, it is who is doing the clicking.
 #
-# WHAT WORKS INSTEAD -- a persistent Firefox profile. Firefox is
-# launched against chatgpt_profile2/ instead of a throwaway window, so
-# cookies survive between runs. Sign in BY HAND once, in that window,
-# and every later run finds the session already live: no password
-# typing, no bot checks, nothing circumvented. Exactly how a person
-# staying logged in on their own machine works.
+# WHAT WORKS: a plain chrome.exe, launched with subprocess, pointed at
+# a --user-data-dir of our own. No Playwright, no CDP, no automation
+# flags -- to Google it is an ordinary browser, because it is one. The
+# sign-in is done BY HAND once. Chrome writes the session cookies into
+# that folder. Playwright then opens the SAME folder with
+# launch_persistent_context(channel="chrome") and simply inherits
+# them; Google is never involved again, because the session already
+# exists and ChatGPT only checks the cookie.
 #
-# The credential path below is still tried first, because it does work
-# for an OpenAI account with its own password (one not linked to
-# Google or Apple). When it detects the Google hand-off it says so and
-# falls back to waiting for the manual sign-in.
+# So the automation READS a session a human created. It never tries to
+# create one, and nothing here defeats or evades any check.
+#
+# Note the input() wait between the two steps: Chrome must be CLOSED
+# before Playwright opens the profile. One Chrome user-data-dir cannot
+# be open twice -- the second instance hands off to the first and
+# exits, which surfaces as a TargetClosedError.
 
 CHATGPT_HOME_URL = "https://chatgpt.com/"
-CHATGPT_LOGIN_URL = "https://chatgpt.com/auth/login"
 
 # Default page timeout for the ChatGPT tab. Named because sending the
-# master document temporarily raises it and has to put it back.
+# rulebook temporarily raises it and has to put it back.
 CHATGPT_PAGE_TIMEOUT = 15000
 
-# Cookies live here, next to the script, so System 2 keeps its own
-# ChatGPT session and never shares one with System 1.
-CHATGPT_PROFILE_DIR = os.path.join(script_dir(), "chatgpt_profile2")
+# Cookies live here, next to the script, so System 3 keeps its own
+# ChatGPT session and never shares one with System 1 or 2. Named
+# profiles let several accounts sit side by side.
+CHATGPT_PROFILE_DIR = os.path.join(
+    script_dir(), "chatgpt_profiles", CHATGPT_PROFILE_NAME,
+)
 
-# How long --chatgpt-login waits for a hand sign-in before giving up.
-# 15 minutes. 5 was not enough in practice: the hand sign-in ran
-# into OpenAI's phone_account_conflict error and the timer expired
-# while it was still being sorted out.
-CHATGPT_MANUAL_LOGIN_WAIT_SECONDS = 900
+# The portal gets a profile of its own. It MUST be separate: two
+# Playwright contexts cannot share one Chrome user-data-dir.
+PORTAL_PROFILE_DIR = os.path.join(script_dir(), "portal_chrome_profile3")
 
 # Text that means a bot wall, not a login problem.
 CHATGPT_BOT_WALL_MARKERS = (
@@ -1171,47 +1189,129 @@ CHATGPT_BOT_WALL_MARKERS = (
     "ray id",
 )
 
-# Google's refusal to talk to an automated browser.
-GOOGLE_REJECTED_MARKERS = (
-    "may not be secure",
-    "try using a different browser",
-    "couldn't sign you in",
+CHATGPT_COMPOSER_SELECTORS = (
+    "#prompt-textarea",
+    "#mobile-composer-prompt",
+    'textarea[name="prompt"]',
+    'textarea[placeholder*="Ask"]',
+    'div[contenteditable="true"]',
 )
 
-CHATGPT_LOGIN_BUTTON_SELECTORS = (
-    '[data-testid="login-button"]',
-    'button:has-text("Log in")',
-    'a:has-text("Log in")',
-    'button:has-text("Sign in")',
-    'a:has-text("Sign in")',
+CHATGPT_SEND_SELECTORS = (
+    '[data-testid="send-button"]',
+    'button[aria-label="Send message"]',
+    'button[aria-label*="Send"]',
 )
 
-CHATGPT_EMAIL_SELECTORS = (
-    'input[name="email"]',
-    "#email-input",
-    "#username",
-    'input[type="email"]',
-    'input[autocomplete="email"]',
-)
-
-CHATGPT_PASSWORD_SELECTORS = (
-    'input[name="password"]',
-    "#password",
-    'input[type="password"]',
-    'input[autocomplete="current-password"]',
-)
-
-CHATGPT_CONTINUE_SELECTORS = (
-    'button[type="submit"]',
-    'button:has-text("Continue")',
-    'button[value="default"]',
-    'input[type="submit"]',
+# Where an answer lives in the DOM. The role attribute is the clean
+# one, but the layout served can differ from the one it was read off,
+# so a plain-prose fallback is tried too -- an answer visibly on
+# screen must never be reported as "no reply".
+CHATGPT_ASSISTANT_SELECTORS = (
+    '[data-message-author-role="assistant"]',
+    "div.agent-turn",
+    'article:has([data-message-author-role="assistant"])',
+    "div.markdown.prose",
+    "div.markdown",
 )
 
 # chatgpt.com's own session endpoint. This is the authoritative
 # answer to "are we signed in": it returns a JSON object with a
 # "user" key when the cookies are good, and {} when they are not.
 CHATGPT_SESSION_API = "https://chatgpt.com/api/auth/session"
+
+# Signs that chatgpt.com will not answer without an account.
+CHATGPT_GATE_MARKERS = (
+    "log in to continue",
+    "sign up to continue",
+    "you've reached our limit of messages",
+    "rate limit",
+    "please log in",
+    "create an account to continue",
+    "sign in to continue",
+    "sign in is required",
+)
+
+# The "Message limit reached" dialog. An anonymous chat has a low cap;
+# once it is hit the send button still clicks and the answer simply
+# never arrives, which reads exactly like a wedged composer. The cap is
+# per CONVERSATION, so the dialog's own "New chat" option clears it --
+# observed 2026-09-07, where try 3 of the rulebook went through on a
+# new chat after two refusals.
+CHATGPT_LIMIT_MARKERS = (
+    "message limit reached",
+    "reached the anonymous message limit",
+    "reached our limit of messages",
+    "you've reached your limit",
+)
+
+# "New chat" inside that dialog first, then the sidebar's own New chat.
+CHATGPT_NEW_CHAT_SELECTORS = (
+    '[role="dialog"] button:has-text("New chat")',
+    '[role="dialog"] a:has-text("New chat")',
+    'button:has-text("New chat")',
+    'a[href="/"]:has-text("New chat")',
+)
+
+
+# Chrome downloads its on-device AI model (Gemini Nano) into any fresh
+# user-data-dir it is given. MEASURED 2026-09-08: 4,072 MB in
+# chatgpt_profiles/acct4, against ~130 MB for everything else in that
+# profile put together -- and it has nothing to do with the ChatGPT
+# session. These switches stop it being fetched at all.
+#
+# Applied to BOTH launch paths on purpose. The sign-in Chrome is the
+# window that stays open longest, while someone types a password, and
+# that is the one that actually pulled the 4 GB.
+#
+# Nothing here is an automation marker: these only turn off a model
+# download, so the sign-in window stays an ordinary browser as far as
+# Google is concerned. See clean_profiles.py for clearing what has
+# already accumulated.
+CHROME_NO_MODEL_DOWNLOAD_ARGS = [
+    "--disable-features=OptimizationGuideModelDownloading,"
+    "OptimizationGuideOnDeviceModel,OptimizationHints",
+]
+
+
+def find_chrome_executable():
+    """
+    The installed Google Chrome, or None.
+
+    Looked up explicitly rather than left to playwright's channel
+    lookup, because this one is launched as a NORMAL browser -- the
+    whole point being that playwright is not involved.
+    """
+    candidates = [
+        os.path.join(os.environ.get("PROGRAMFILES", ""),
+                     "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("PROGRAMFILES(X86)", ""),
+                     "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                     "Google", "Chrome", "Application", "chrome.exe"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def launch_chrome_context(playwright, profile_dir, extra_args=None):
+    """
+    Playwright against a Chrome profile folder that survives between
+    runs -- what keeps a session alive from one run to the next.
+
+    channel="chrome" drives the REAL installed Chrome rather than
+    playwright's bundled Chromium, which is not installed on this
+    machine. Raises on failure; callers decide what a locked profile
+    means.
+    """
+    args = ["--disable-extensions"] + list(CHROME_NO_MODEL_DOWNLOAD_ARGS)
+    if extra_args:
+        args.extend(extra_args)
+    return playwright.chromium.launch_persistent_context(
+        profile_dir, channel="chrome", headless=False, args=args,
+    )
 
 
 def _chatgpt_page_text(page, timeout=6000):
@@ -1240,21 +1340,25 @@ def _chatgpt_bot_wall(page):
     return None
 
 
-def _chatgpt_google_rejected(page):
+def _browser_is_gone(page):
     """
-    True when Google has refused this browser. Checked by URL as well
-    as text: the refusal page is /signin/rejected, and it flickers
-    back to /signin/identifier every few seconds, so a text-only test
-    misses it half the time.
+    True once the Chrome window has been closed underneath us.
+
+    Worth its own test because a dead browser and a page that simply
+    has not loaded look identical to every is_visible() call: a run on
+    2026-09-08 sat in a polling loop against a window that had already
+    closed, reporting nothing at all.
     """
     try:
-        url = (page.url or "").lower()
-    except Exception:
-        url = ""
-    if "signin/rejected" in url:
-        return True
-    text = _chatgpt_page_text(page, timeout=3000)
-    return any(marker in text for marker in GOOGLE_REJECTED_MARKERS)
+        if page.is_closed():
+            return True
+        page.evaluate("() => 1")
+        return False
+    except Exception as exc:
+        blob = f"{type(exc).__name__} {exc}".lower()
+        return ("targetclosed" in blob
+                or "has been closed" in blob
+                or "browser has been closed" in blob)
 
 
 def _chatgpt_wait_for_any(page, selectors, what, timeout=25000):
@@ -1262,11 +1366,11 @@ def _chatgpt_wait_for_any(page, selectors, what, timeout=25000):
     Poll the whole selector list until one is visible, and return that
     selector (None on timeout).
 
-    The waiting is the point. chatgpt.com is a React app: the login
-    form does not exist in the HTML that domcontentloaded fires on, it
-    is built a few seconds later. An earlier version of this code
-    checked once, immediately, and reported "no email field found" on
-    a page that plainly had one.
+    The waiting is the point. chatgpt.com is a React app: the composer
+    does not exist in the HTML that domcontentloaded fires on, it is
+    built a few seconds later. An earlier version checked once,
+    immediately, and reported "no composer" on a page that plainly had
+    one.
     """
     deadline = time.time() + (timeout / 1000.0)
     while True:
@@ -1280,56 +1384,6 @@ def _chatgpt_wait_for_any(page, selectors, what, timeout=25000):
         if time.time() >= deadline:
             return None
         time.sleep(0.5)
-
-
-def _chatgpt_click_first(page, selectors, what, timeout=8000):
-    """Click the first selector in the list that becomes visible."""
-    selector = _chatgpt_wait_for_any(page, selectors, what, timeout=timeout)
-    if not selector:
-        print(f"    no {what} found on this page")
-        return False
-    try:
-        page.locator(selector).first.click(timeout=timeout)
-        print(f"    clicked {what}: {selector}")
-        return True
-    except Exception as exc:
-        print(f"    {what} ({selector}) would not click "
-              f"({type(exc).__name__}) -- retrying forced")
-        try:
-            page.locator(selector).first.click(force=True, timeout=4000)
-            print(f"    forced click on {what} succeeded")
-            return True
-        except Exception as exc2:
-            print(f"    forced click on {what} also failed "
-                  f"({type(exc2).__name__})")
-            return False
-
-
-def _chatgpt_type_first(page, selectors, value, what, timeout=25000):
-    """
-    Type into the first selector that becomes visible, one key at a
-    time. Never prints the value.
-
-    press_sequentially, not fill: these are React controlled inputs.
-    fill() sets the value and the box LOOKS right, but React's state
-    never updates, so Continue submits an empty form and the page just
-    re-renders itself. That exact false negative was observed here --
-    the email appeared to be entered and the form came back blank.
-    """
-    selector = _chatgpt_wait_for_any(page, selectors, what, timeout=timeout)
-    if not selector:
-        print(f"    no {what} field found on this page")
-        return False
-    try:
-        target = page.locator(selector).first
-        target.click(timeout=4000)
-        target.press_sequentially(value, delay=60, timeout=15000)
-        print(f"    typed {what} into {selector}")
-        return True
-    except Exception as exc:
-        print(f"    {what} field {selector} would not accept input "
-              f"({type(exc).__name__})")
-        return False
 
 
 def _chatgpt_session_user(page):
@@ -1352,13 +1406,41 @@ def _chatgpt_session_user(page):
     return None
 
 
+def _chatgpt_logged_in(page, timeout=15000):
+    """
+    True only when chatgpt.com itself reports a signed-in user.
+
+    ONLY the session endpoint is trusted, on purpose. Two DOM-based
+    tests were tried here first and both reported a brand-new, empty
+    profile as "ALREADY LOGGED IN":
+
+      * the composer -- chatgpt.com shows "Ask ChatGPT" to signed-OUT
+        visitors too, so it proves nothing;
+      * composer AND no visible login button -- defeated by hidden
+        "Log in" buttons in the DOM.
+
+    Signed out, /api/auth/session returns {"WARNING_BANNER": ...} with
+    no "user" key; signed in, it carries the account. A transient
+    failure of the endpoint reports "not signed in", which merely asks
+    for a sign-in that is not needed -- the safe direction to be wrong
+    in.
+    """
+    deadline = time.time() + (timeout / 1000.0)
+    while True:
+        if _chatgpt_session_user(page):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(1)
+
+
 def _chatgpt_set_composer_text(page, selector, text):
     """
     Put text into the composer using JavaScript. Returns True if it
     stuck.
 
     Why not the keyboard: typing needs the page focused, and focusing
-    it makes Firefox raise its window in front of whatever the user is
+    it makes Chrome raise its window in front of whatever the user is
     doing -- once per record, which is intolerable for something meant
     to run in the background.
 
@@ -1393,60 +1475,8 @@ def _chatgpt_set_composer_text(page, selector, text):
         return False
 
 
-def _chatgpt_js_click(page, selectors, what):
-    """
-    Click via element.click() in JS -- no pointer, no focus, so the
-    window is not raised and an overlay cannot intercept it.
-    """
-    for selector in selectors:
-        try:
-            clicked = page.evaluate(
-                """(sel) => {
-                    const el = document.querySelector(sel);
-                    if (!el || el.disabled) return false;
-                    el.click();
-                    return true;
-                }""",
-                selector,
-            )
-        except Exception:
-            continue
-        if clicked:
-            print(f"    clicked {what} in JS: {selector}")
-            return True
-    return False
-
-
-def _chatgpt_logged_in(page, timeout=15000):
-    """
-    True only when chatgpt.com itself reports a signed-in user.
-
-    ONLY the session endpoint is trusted, on purpose. Two DOM-based
-    tests were tried here first and both reported a brand-new, empty
-    profile as "ALREADY LOGGED IN":
-
-      * the composer -- chatgpt.com shows "Ask ChatGPT" to signed-OUT
-        visitors too, so it proves nothing;
-      * composer AND no visible login button -- defeated by the hidden
-        "Log in" buttons described above.
-
-    Signed out, /api/auth/session returns {"WARNING_BANNER": ...} with
-    no "user" key; signed in, it carries the account. A transient
-    failure of the endpoint reports "not signed in", which merely asks
-    for a sign-in that is not needed -- the safe direction to be wrong
-    in.
-    """
-    deadline = time.time() + (timeout / 1000.0)
-    while True:
-        if _chatgpt_session_user(page):
-            return True
-        if time.time() >= deadline:
-            return False
-        time.sleep(1)
-
-
 def _chatgpt_shot(page, name):
-    """Screenshot into debug2/, timestamped so runs never overwrite one another."""
+    """Screenshot into debug3/, timestamped so runs never overwrite one another."""
     stamp = time.strftime("%Y%m%d_%H%M%S")
     path = debug_path(f"chatgpt_{name}_{stamp}.png")
     try:
@@ -1457,185 +1487,62 @@ def _chatgpt_shot(page, name):
     return path
 
 
-def chatgpt_credential_login(page, email, password):
-    """
-    Try the email + password flow on chatgpt.com.
-
-    Returns one of:
-        "ok"       -- logged in, composer on screen
-        "google"   -- the account is Google-linked; Google refused the
-                      scripted browser. Hand sign-in required.
-        "blocked"  -- a Cloudflare/Arkose bot wall
-        "failed"   -- anything else (with a screenshot in debug2/)
-    """
-    try:
-        page.goto(
-            CHATGPT_LOGIN_URL, wait_until="domcontentloaded", timeout=30000,
-        )
-    except Exception as exc:
-        print(f"  could not open {CHATGPT_LOGIN_URL}: "
-              f"{type(exc).__name__} {exc}")
-        _chatgpt_shot(page, "goto_failed")
-        return "failed"
-
-    # Cloudflare's interstitial replaces itself with the real page
-    # within a few seconds when it is going to let us through at all.
-    for _ in range(6):
-        if not _chatgpt_bot_wall(page):
-            break
-        time.sleep(2)
-    wall = _chatgpt_bot_wall(page)
-    if wall:
-        print(f"  BLOCKED by a bot check -- the page says {wall!r}.")
-        print("  That is the Cloudflare/Arkose wall, not a wrong password.")
-        _chatgpt_shot(page, "bot_wall")
-        return "blocked"
-
-    print(f"  landed on: {page.url}")
-
-    # Either a splash with a 'Log in' button, or the email box itself.
-    found = _chatgpt_wait_for_any(
-        page,
-        CHATGPT_EMAIL_SELECTORS + CHATGPT_LOGIN_BUTTON_SELECTORS,
-        "login form",
-        timeout=30000,
-    )
-    if not found:
-        print("  the login page rendered nothing usable in 30s.")
-        _chatgpt_shot(page, "empty_login_page")
-        return "failed"
-    if found in CHATGPT_LOGIN_BUTTON_SELECTORS:
-        print("  splash page -- opening the login form first")
-        _chatgpt_click_first(
-            page, CHATGPT_LOGIN_BUTTON_SELECTORS, "'Log in' button",
-        )
-
-    print("  step 1/2 -- email")
-    if not _chatgpt_type_first(page, CHATGPT_EMAIL_SELECTORS, email, "email"):
-        _chatgpt_shot(page, "no_email_field")
-        return "failed"
-    _chatgpt_click_first(page, CHATGPT_CONTINUE_SELECTORS, "'Continue'")
-
-    # What comes back decides everything: an OpenAI password box, or a
-    # hand-off to Google.
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        if _chatgpt_google_rejected(page):
-            print("  GOOGLE HAND-OFF, AND GOOGLE SAID NO.")
-            print("  This account signs in with Google, and Google refuses")
-            print("  an automated browser ('this browser or app may not be")
-            print("  secure'). The password box is never shown, so the")
-            print("  password cannot be entered. Not a wrong password.")
-            _chatgpt_shot(page, "google_rejected")
-            return "google"
-        if "accounts.google.com" in (page.url or ""):
-            print(f"  redirected to Google: {page.url[:70]}")
-        try:
-            if page.locator('input[type="password"]').first.is_visible():
-                break
-        except Exception:
-            pass
-        time.sleep(1)
-
-    print("  step 2/2 -- password")
-    if not _chatgpt_type_first(
-        page, CHATGPT_PASSWORD_SELECTORS, password, "password", timeout=10000,
-    ):
-        if "accounts.google.com" in (page.url or ""):
-            print("  (still on Google, and it never offered a password box)")
-            _chatgpt_shot(page, "google_no_password")
-            return "google"
-        _chatgpt_shot(page, "no_password_field")
-        return "failed"
-    _chatgpt_click_first(page, CHATGPT_CONTINUE_SELECTORS, "'Continue'")
-
-    if _chatgpt_logged_in(page, timeout=25000):
-        return "ok"
-
-    if _chatgpt_google_rejected(page):
-        _chatgpt_shot(page, "google_rejected_late")
-        return "google"
-
-    text = _chatgpt_page_text(page)
-    for phrase in (
-        "incorrect email or password",
-        "wrong password",
-        "password is incorrect",
-        "too many attempts",
-        "verify your email",
-        "two-factor",
-        "verification code",
-        "verify it's you",
-    ):
-        if phrase in text:
-            print(f"  LOGIN REFUSED -- the page says: {phrase!r}")
-            _chatgpt_shot(page, "login_refused")
-            return "failed"
-
-    print("  password submitted, but the chat composer never appeared.")
-    print(f"  currently at: {page.url}")
-    _chatgpt_shot(page, "unknown_state")
-    return "failed"
-
-
-def chatgpt_wait_for_manual_login(page, seconds=None):
-    """
-    Hold the window open while the sign-in is done by hand, polling for
-    the chat composer. Returns True once the session is live.
-    """
-    if seconds is None:
-        seconds = CHATGPT_MANUAL_LOGIN_WAIT_SECONDS
-
-    print()
-    print("  " + "=" * 62)
-    print("  SIGN IN BY HAND IN THE FIREFOX WINDOW THAT IS OPEN NOW.")
-    print("  " + "=" * 62)
-    print("  Use 'Continue with Google' -- it is a real browser window,")
-    print("  so Google accepts it. The credentials are the ones in .env2.")
-    print()
-    print(f"  Cookies are saved in {CHATGPT_PROFILE_DIR}")
-    print("  so this is a ONE-TIME step: later runs open already logged in.")
-    print(f"  Waiting up to {seconds // 60} minutes...")
-    print()
-
-    deadline = time.time() + seconds
-    last_report = 0
-    while time.time() < deadline:
-        if _chatgpt_logged_in(page, timeout=1000):
-            print("  detected a live session -- signed in.")
-            return True
-        waited = int(time.time() - (deadline - seconds))
-        if waited - last_report >= 30:
-            last_report = waited
-            print(f"    still waiting ({waited}s)... current page: "
-                  f"{(page.url or '')[:60]}")
-        time.sleep(2)
-
-    print("  timed out waiting for a hand sign-in.")
-    return False
-
-
 def chatgpt_login_mode(playwright):
     """
-    --chatgpt-login : open ChatGPT in System 2's own persistent Firefox
-    profile, get a live session, and report honestly which way it was
-    obtained. The portal is never touched in this mode.
-    """
-    email = os.environ.get("CHATGPT_EMAIL", "")
-    password = os.environ.get("CHATGPT_PASSWORD", "")
+    --chatgpt-login : open ChatGPT in a NORMAL, non-automated Chrome
+    window so Google permits the sign-in. After that window is closed,
+    verify the saved session with the automation profile. The portal is
+    never touched in this mode.
 
+    See the section comment above for why it is done this way. In
+    short: a human signs in, in a real browser; playwright only ever
+    reads the cookies that sign-in left behind.
+    """
     print("-" * 70)
-    print("CHATGPT LOGIN  [SYSTEM 2]")
-    print(f"  account: {email or '(none in .env2)'}")
+    print("CHATGPT LOGIN  [SYSTEM 3]")
     print(f"  profile: {CHATGPT_PROFILE_DIR}")
 
+    chrome_executable = find_chrome_executable()
+    if not chrome_executable:
+        print("  Google Chrome was not found in its standard Windows locations.")
+        print("  Install Chrome, or edit find_chrome_executable().")
+        return False
+
+    print("  opening a NORMAL Chrome window for sign-in")
+    print("  (not automated -- that is the point; Google accepts it)")
+    print()
+    print("  1. sign in to ChatGPT in that window")
+    print("  2. CLOSE that Chrome window completely")
+    print("  3. come back here and press Enter")
+    print()
     try:
-        context = playwright.firefox.launch_persistent_context(
-            CHATGPT_PROFILE_DIR, headless=False,
-        )
+        subprocess.Popen([
+            chrome_executable,
+            f"--user-data-dir={CHATGPT_PROFILE_DIR}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            *CHROME_NO_MODEL_DOWNLOAD_ARGS,
+            CHATGPT_HOME_URL,
+        ])
     except Exception as exc:
-        print(f"  could not open the persistent profile: "
+        print(f"  could not open normal Chrome: {type(exc).__name__} {exc}")
+        return False
+
+    try:
+        input("  Press Enter AFTER closing the Chrome sign-in window: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+
+    # The profile must be free before playwright can open it. If Chrome
+    # is still running, this is the failure that shows up.
+    context = None
+    try:
+        context = launch_chrome_context(playwright, CHATGPT_PROFILE_DIR)
+    except Exception as exc:
+        print(f"  could not verify the Chrome profile: "
               f"{type(exc).__name__} {exc}")
+        print("  The sign-in Chrome window is probably still open --")
+        print("  close it completely and run --chatgpt-login again.")
         return False
 
     page = context.pages[0] if context.pages else context.new_page()
@@ -1644,8 +1551,6 @@ def chatgpt_login_mode(playwright):
 
     logged_in = False
     try:
-        # 1. Is the saved session still good? This is the fast path
-        #    every run after the first one takes.
         try:
             page.goto(
                 CHATGPT_HOME_URL, wait_until="domcontentloaded", timeout=30000,
@@ -1653,44 +1558,22 @@ def chatgpt_login_mode(playwright):
         except Exception as exc:
             print(f"  could not open chatgpt.com: {type(exc).__name__}")
 
-        if _chatgpt_logged_in(page, timeout=15000):
+        logged_in = _chatgpt_logged_in(page, timeout=15000)
+        if logged_in:
             who = _chatgpt_session_user(page) or "(account not reported)"
-            print("  ALREADY LOGGED IN from the saved profile -- nothing to do.")
+            print("  ChatGPT sign-in detected in the saved Chrome profile.")
             print(f"  signed in as: {who}")
             print(f"  now at: {page.url}")
             _chatgpt_shot(page, "session_restored")
-            logged_in = True
-
-        # 2. No saved session. Try the credential flow, which works
-        #    for an OpenAI-password account.
-        elif email and password:
-            print("  no saved session -- trying the credentials from .env2")
-            result = chatgpt_credential_login(page, email, password)
-            if result == "ok":
-                print("  LOGGED IN with the .env2 credentials.")
-                _chatgpt_shot(page, "logged_in")
-                logged_in = True
-            else:
-                print(f"  credential login did not succeed ({result}).")
-                logged_in = chatgpt_wait_for_manual_login(page)
-                if logged_in:
-                    _chatgpt_shot(page, "logged_in_by_hand")
         else:
-            print("  no CHATGPT_EMAIL / CHATGPT_PASSWORD in .env2.")
-            logged_in = chatgpt_wait_for_manual_login(page)
-            if logged_in:
-                _chatgpt_shot(page, "logged_in_by_hand")
+            print("  ChatGPT is still logged out in the saved Chrome profile.")
+            print("  Nothing was saved. Run --chatgpt-login again and make")
+            print("  sure the sign-in completes BEFORE closing the window.")
 
         print("-" * 70)
         print("ChatGPT login:", "SUCCESS" if logged_in else "FAILED")
         if logged_in:
             print("The session is saved. Later runs will not ask again.")
-        print("The browser window is left open on purpose.")
-        print("Press Enter in this terminal to close it.")
-        try:
-            input()
-        except Exception:
-            pass
     finally:
         try:
             context.close()
@@ -1705,11 +1588,11 @@ def hold_portal_login_open(portal, seconds=None):
     --login-only : confirm the portal session is real, then leave the
     window open and idle.
 
-    The session is verified rather than assumed. main() prints "Login
+    The session is verified rather than assumed. Printing "Login
     successful." straight after clicking the button, without checking
-    anything -- on bad credentials that line prints while the login
-    page is still on screen. looks_like_login_page() is the same test
-    the submission path already uses to spot an expired session.
+    anything, means that line prints on bad credentials while the
+    login page is still on screen. looks_like_login_page() is the same
+    test the submission path uses to spot an expired session.
     """
     if seconds is None:
         seconds = PORTAL_HOLD_SECONDS
@@ -1728,7 +1611,7 @@ def hold_portal_login_open(portal, seconds=None):
             print(f"  title: {portal.title()}")
         except Exception:
             pass
-        print("  The credentials in .env2 were not accepted.")
+        print("  The credentials in .env3 were not accepted.")
     else:
         print("  PORTAL LOGIN CONFIRMED -- past the login page.")
         print(f"  url:   {portal.url}")
@@ -1761,120 +1644,21 @@ def hold_portal_login_open(portal, seconds=None):
 
 
 # ============================================================
-# PORTAL + CHATGPT FLOW  (SYSTEM 2 ONLY)
+# PORTAL + CHATGPT FLOW
 # ============================================================
-#     python website_verifier2.py --gpt-flow
+# Window 1: the copy-paste portal, logged in, in its own profile.
+# Window 2: chatgpt.com, in the signed-in ChatGPT profile.
 #
-# Tab 1: the copy-paste portal, logged in.
-# Tab 2: chatgpt.com, in the same window, sharing the same profile.
+# They are SEPARATE persistent contexts on purpose: one Chrome
+# user-data-dir cannot be driven by two playwright contexts at once.
 #
-# Then, in order: feed RULES.md into a fresh chat, go back to the
-# portal, read the assigned URL, and send that URL into the SAME chat
-# so it is answered with the rules already in context.
-#
-# Nothing is submitted to the portal in this mode. The URL is read
-# only -- no status is set, no button is clicked, no record is
-# completed.
-
-# The composer. Firefox is served the mobile composer (a real
-# <textarea>) rather than the desktop contenteditable, so both shapes
-# are listed -- measured, not assumed.
-CHATGPT_COMPOSER_SELECTORS = (
-    "#prompt-textarea",
-    "#mobile-composer-prompt",
-    'textarea[name="prompt"]',
-    'textarea[placeholder*="Ask"]',
-    'div[contenteditable="true"]',
-)
-
-CHATGPT_SEND_SELECTORS = (
-    '[data-testid="send-button"]',
-    'button[aria-label="Send message"]',
-    'button[aria-label*="Send"]',
-)
-
-# Where an answer lives in the DOM. The role attribute is the clean
-# one, but Firefox is served a different (mobile) layout than the one
-# it was read off, so a plain-prose fallback is tried too -- an answer
-# visibly on screen must never be reported as "no reply".
-CHATGPT_ASSISTANT_SELECTORS = (
-    '[data-message-author-role="assistant"]',
-    "div.agent-turn",
-    'article:has([data-message-author-role="assistant"])',
-    "div.markdown.prose",
-    "div.markdown",
-)
-
-# Signs that chatgpt.com will not answer without an account.
-CHATGPT_GATE_MARKERS = (
-    "log in to continue",
-    "sign up to continue",
-    "you've reached our limit of messages",
-    "rate limit",
-    "please log in",
-    "create an account to continue",
-    # The wall the anonymous allowance ends at, in the site's own
-    # words -- "Sign in to continue / Sign in is required to
-    # continue." Note SIGN in, not LOG in: the entry above did not
-    # match it, so the wall read as a missing composer and the record
-    # retried forever, re-sending the whole rulebook each time.
-    "sign in to continue",
-    "sign in is required",
-)
-
-# The same wall, kept separately so the run can say what it is and
-# back off instead of hammering. A new chat does NOT clear it: the
-# allowance belongs to the anonymous session, which is why the
-# message-limit recovery cannot rescue this one -- only signing in,
-# or a new browser profile, will.
-CHATGPT_SIGNIN_WALL_MARKERS = (
-    "sign in to continue",
-    "sign in is required",
-    "log in to continue",
-    "create an account to continue",
-)
-
-# How long to wait when that wall appears. Long, deliberately: it
-# cannot be retried away, and a tight loop only re-sends 75,000
-# characters of rulebook into a session that will refuse it.
-SIGNIN_WALL_WAIT_SECONDS = 300
-
-# The "Message limit reached" dialog. An anonymous chat has a low cap;
-# once it is hit the send button still clicks and the answer simply
-# never arrives, which reads exactly like a wedged composer. The cap is
-# per CONVERSATION, so the dialog's own "New chat" option clears it --
-# observed 2026-09-07, where try 3 of the rulebook went through on a
-# new chat after two refusals.
-CHATGPT_LIMIT_MARKERS = (
-    "message limit reached",
-    "reached the anonymous message limit",
-    "reached our limit of messages",
-    "you've reached your limit",
-)
-
-# "New chat" inside that dialog first, then the sidebar's own New chat.
-# Either lands in an empty conversation; the dialog's button is
-# preferred because it needs no navigation.
-#
-# The sidebar control was READ OFF the live page, not guessed:
-#     <a data-testid="create-new-chat-button" href="/">New chat</a>
-# The test-id goes first because it is the site's own handle and
-# survives copy changes; the text and href variants stay behind it in
-# case the id is renamed. A probe found the id present twice (the
-# sidebar link and its keyboard-shortcut twin), so .first matters.
-CHATGPT_NEW_CHAT_SELECTORS = (
-    '[role="dialog"] button:has-text("New chat")',
-    '[role="dialog"] a:has-text("New chat")',
-    '[data-testid="create-new-chat-button"]',
-    'a[href="/"]:has-text("New chat")',
-    'button:has-text("New chat")',
-)
-
+# Then, in order: feed the rulebook into a chat, go back to the
+# portal, read the assigned URL, send that URL into the SAME chat so
+# it is answered with the rules already in context, and submit the
+# verdict.
 
 def read_rules_document():
-    """RULES.md as text -- the rulebook CLAUDE.md names as authoritative."""
-    # RULES.md is the last-resort fallback and normally absent from
-    # System 2's folder, so its absence is not worth a warning.
+    """RULES.md as text -- the last-resort fallback rulebook."""
     path = project_file("RULES.md")
     if not path:
         return ""
@@ -1897,7 +1681,7 @@ def portal_log_in(page):
     username = os.environ.get("PORTAL_USERNAME", "")
     password = os.environ.get("PORTAL_PASSWORD", "")
     if not username or not password:
-        print("  no PORTAL_USERNAME / PORTAL_PASSWORD in .env2")
+        print("  no PORTAL_USERNAME / PORTAL_PASSWORD in .env3")
         return False
 
     try:
@@ -1910,8 +1694,8 @@ def portal_log_in(page):
         return False
 
     print(f"  logging in as {username}")
-    # Same wait as main(): the Terms & Conditions block on this page
-    # can push #Email past the default timeout.
+    # The Terms & Conditions block on this page can push #Email past
+    # the default timeout.
     try:
         page.wait_for_selector("#Email", state="visible", timeout=30000)
     except Exception:
@@ -1987,6 +1771,7 @@ def _chatgpt_main_text(page):
 # finished.
 CHATGPT_FOOTER_MARKERS = (
     "ChatGPT is AI and can make mistakes",
+    "ChatGPT can make mistakes",
     "Chat with ChatGPT",
     "You'll get smarter responses",
     "You’ll get smarter responses",
@@ -2012,6 +1797,9 @@ def _chatgpt_answer_body(text):
         cut = body.find(footer)
         if cut != -1:
             body = body[:cut]
+    # Newer ChatGPT layouts place the response controls after a short
+    # disclaimer, so remove the trailing control label as well.
+    body = re.sub(r"\n\s*Think\s*$", "", body, flags=re.I)
     return body.strip()
 
 
@@ -2034,9 +1822,10 @@ CHATGPT_PROGRESS_MARKERS = (
 
 # How long an answer must sit unchanged before it counts as finished,
 # and how often to look. The quiet window only applies to answers that
-# can still grow -- see the fast path in _chatgpt_wait_for_reply().
+# can still grow -- see the fast paths in _chatgpt_wait_for_reply().
 REPLY_QUIET_SECONDS = 5
 REPLY_POLL_SECONDS = 0.4
+STATUS_HEARTBEAT_SECONDS = 30
 
 # Scrolling queries every element under <main>, which gets expensive as
 # the conversation grows, so it does not need doing on every poll.
@@ -2074,8 +1863,7 @@ def _chatgpt_is_complete_qualifies(body):
     Deliberately strict. A block still streaming fails here -- the
     field currently arriving has no value yet -- and falls through to
     the quiet window, which is what protects a paid submission from
-    being read half-written. The "Address Y: <value>" variant also
-    fails and takes the careful path; slower is the safe direction.
+    being read half-written.
     """
     text = re.sub(r"[*#`]", "", body or "")
     if "@" not in text:
@@ -2104,7 +1892,7 @@ def _chatgpt_is_definite_skip(body):
     if "qualifies" in lowered:
         return False
     # Drop a leading glyph or bullet, then require SKIP first.
-    head = text.lstrip("-*#>■❌ ").upper()
+    head = text.lstrip("-*#>•–— ").upper()
     return head.startswith("SKIP")
 
 
@@ -2140,8 +1928,8 @@ def _chatgpt_scroll_to_bottom(page):
     """
     Bring the newest message into view.
 
-    Necessary because the conversation is virtualised: with the master
-    document pasted in as a 52,000-character message, the view stays
+    Necessary because the conversation is virtualised: with the
+    rulebook pasted in as a 50,000+ character message, the view stays
     up inside that text and the reply below it is not rendered at all,
     so reading the page finds no answer even though one exists.
     """
@@ -2187,6 +1975,21 @@ def _chatgpt_gate(page):
     return None
 
 
+def chatgpt_message_limit(page):
+    """
+    The message-limit text showing on the page, or None.
+
+    Worth checking before blaming the composer: at the cap the send
+    button still clicks and the reply never comes, so a limited chat
+    and a wedged one look identical in the log.
+    """
+    text = _chatgpt_page_text(page, timeout=4000)
+    for marker in CHATGPT_LIMIT_MARKERS:
+        if marker in text:
+            return marker
+    return None
+
+
 def _chatgpt_wait_for_reply(page, before_count, timeout=300,
                             baseline_text="", sent_text=""):
     """
@@ -2204,8 +2007,19 @@ def _chatgpt_wait_for_reply(page, before_count, timeout=300,
     previous_answer = _chatgpt_answer_body(baseline_text)
     polls = 0
     limit_polls = 0
+    last_heartbeat = time.time()
 
     while time.time() < deadline:
+        if _browser_is_gone(page):
+            print("    the ChatGPT window was closed while waiting.")
+            return ""
+
+        now = time.time()
+        if now - last_heartbeat >= STATUS_HEARTBEAT_SECONDS:
+            elapsed = int(now - (deadline - timeout))
+            print(f"    status: still waiting for ChatGPT reply ({elapsed}s elapsed)")
+            last_heartbeat = now
+
         gate = _chatgpt_gate(page)
         if gate:
             print(f"    chatgpt.com is refusing: {gate!r}")
@@ -2235,12 +2049,6 @@ def _chatgpt_wait_for_reply(page, before_count, timeout=300,
             # is taken from the conversation text instead: whatever
             # appeared since the message was sent, once it stops
             # growing. Nothing here depends on class names.
-            # Read the LAST answer directly rather than diffing the
-            # whole transcript. Diffing broke once the conversation
-            # started with a 52,000-character message: the container
-            # virtualises, the rendered text changes shape as it
-            # scrolls, and the common-prefix comparison stopped
-            # meaning anything.
             polls += 1
             if polls % SCROLL_EVERY_N_POLLS == 1:
                 _chatgpt_scroll_to_bottom(page)
@@ -2251,9 +2059,9 @@ def _chatgpt_wait_for_reply(page, before_count, timeout=300,
                 # transcript, so the answer after it is unambiguous.
                 current = _chatgpt_answer_after(whole, sent_text)
             else:
-                # The master document is far too long to still be
-                # rendered in full, so fall back to the last answer
-                # and require it to differ from what was there before.
+                # The rulebook is far too long to still be rendered in
+                # full, so fall back to the last answer and require it
+                # to differ from what was there before.
                 current = _chatgpt_answer_body(whole)
                 if previous_answer and current == previous_answer:
                     time.sleep(REPLY_POLL_SECONDS)
@@ -2304,18 +2112,25 @@ def _chatgpt_wait_for_reply(page, before_count, timeout=300,
 
     if last_text:
         print("    reply timed out mid-stream -- returning what arrived")
+    else:
+        print("    FAILURE: ChatGPT reply timed out with no response")
     return last_text
 
 
-def chatgpt_send_message(page, text, label, reply_timeout=300, attach=None):
+def chatgpt_send_message(
+    page, text, label, reply_timeout=300, attach=None, manual_send=False,
+):
     """
-    Type one message into the open chat and return the reply.
+    Put one message into the open chat and return the reply.
 
-    keyboard.insert_text, not press_sequentially: RULES.md is over
-    13,000 characters and typing it key by key would take about
-    fifteen minutes. insert_text delivers it in one input event, which
-    React accepts -- and unlike typing, its newlines do not send the
-    message early.
+    Three ways in, by size and composer shape:
+      * a real clipboard paste for anything over 20,000 characters --
+        one complete editor operation, dispatching the paste/input
+        events React needs. The rulebook is far too big to type, and
+        synthetic insertion gets unreliable at that size.
+      * keyboard.insert_text for ordinary messages -- one input event,
+        and unlike typing, its newlines do not send the message early.
+      * a JS value-setter fill for plain textareas.
     """
     print(f"  sending {label} ({len(text)} chars)")
 
@@ -2323,7 +2138,7 @@ def chatgpt_send_message(page, text, label, reply_timeout=300, attach=None):
         page, CHATGPT_COMPOSER_SELECTORS, "composer", timeout=30000,
     )
     if not selector:
-        print("    no composer on the page -- cannot send")
+        print("    FAILURE: no composer on the page -- cannot send")
         _chatgpt_shot(page, "no_composer")
         return ""
 
@@ -2333,24 +2148,100 @@ def chatgpt_send_message(page, text, label, reply_timeout=300, attach=None):
     before = len(_chatgpt_assistant_texts(page))
     baseline = _chatgpt_main_text(page)
 
-    # Fill in JavaScript first -- no focus, so the window is not
-    # raised. The keyboard route stays as a fallback because it is the
-    # one proven to satisfy React if the JS setter ever stops working.
-    if not _chatgpt_set_composer_text(page, selector, text):
-        print("    JS fill did not take -- falling back to typing")
+    def load_clipboard():
+        clipboard_file = debug_path("chatgpt_clipboard_payload.txt")
+        with io.open(clipboard_file, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        escaped_path = clipboard_file.replace("'", "''")
+        subprocess.run(
+            [
+                "powershell", "-NoProfile", "-Sta", "-Command",
+                "[IO.File]::ReadAllText('" + escaped_path
+                + "') | Set-Clipboard",
+            ],
+            check=True,
+            timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        print("    clipboard loaded")
+
+    def insert_complete_message():
+        page.keyboard.insert_text(text)
+
+    def paste_complete_message():
+        # Clipboard paste is one complete editor operation and
+        # dispatches the real paste/input events ChatGPT's React
+        # composer needs.
+        load_clipboard()
+        page.keyboard.press("Control+V")
+        print("    complete message pasted")
+
+    def composer_text():
+        try:
+            return page.locator(selector).first.evaluate(
+                "el => el.isContentEditable ? el.textContent : el.value"
+            ) or ""
+        except Exception:
+            return ""
+
+    try:
+        contenteditable = page.locator(selector).first.evaluate(
+            "el => Boolean(el.isContentEditable)"
+        )
+    except Exception:
+        contenteditable = False
+
+    if manual_send:
+        try:
+            load_clipboard()
+            print("    exact rulebook is copied to the clipboard")
+            print("    press Ctrl+V in ChatGPT, click Send, then press Enter here")
+            input("    waiting for manual paste and Send: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+        return _chatgpt_wait_for_reply(
+            page, before, timeout=reply_timeout, baseline_text=baseline,
+            sent_text=text,
+        )
+
+    # Contenteditable ChatGPT composers need a real input event so
+    # React updates its internal draft state. Setting textContent can
+    # look right on screen while leaving Send disabled internally.
+    if contenteditable:
+        print("    entering text through the live ChatGPT editor")
         try:
             box = page.locator(selector).first
-            try:
-                box.click(timeout=5000)
-            except Exception:
-                box.evaluate("el => el.focus()")
-            # The master document is over 50,000 characters, which
-            # takes longer to insert than the page's 15s default. That
-            # once looked like a rejected message rather than a slow
-            # one and killed a run.
+            box.click(timeout=5000)
+            if len(text) > 20000:
+                paste_complete_message()
+            else:
+                insert_complete_message()
+            deadline = time.time() + 5
+            while not composer_text() and time.time() < deadline:
+                time.sleep(0.1)
+        except Exception as exc:
+            print(f"    live editor would not accept the text ({type(exc).__name__})")
+            _chatgpt_shot(page, "composer_rejected")
+            return ""
+    elif not _chatgpt_set_composer_text(page, selector, text):
+        print("    JS fill did not take -- using the editor fill fallback")
+        try:
+            box = page.locator(selector).first
             page.set_default_timeout(180000)
             try:
-                page.keyboard.insert_text(text)
+                box.click(timeout=5000)
+                if len(text) > 20000:
+                    paste_complete_message()
+                else:
+                    insert_complete_message()
+            except Exception:
+                print("    editor fill did not take -- falling back to insertion")
+                try:
+                    box.click(timeout=5000)
+                except Exception:
+                    box.evaluate("el => el.focus()")
+                insert_complete_message()
             finally:
                 page.set_default_timeout(CHATGPT_PAGE_TIMEOUT)
         except Exception as exc:
@@ -2359,16 +2250,53 @@ def chatgpt_send_message(page, text, label, reply_timeout=300, attach=None):
             _chatgpt_shot(page, "composer_rejected")
             return ""
 
-    # Send, also without a pointer click.
-    if not _chatgpt_js_click(page, CHATGPT_SEND_SELECTORS, "send button"):
-        if not _chatgpt_click_first(page, CHATGPT_SEND_SELECTORS,
-                                    "send button", timeout=8000):
-            print("    no send button -- pressing Enter instead")
+    # Send only after ChatGPT has enabled the real button.
+    send_selector = None
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        for candidate in CHATGPT_SEND_SELECTORS:
             try:
-                page.keyboard.press("Enter")
-            except Exception as exc:
-                print(f"    Enter failed too ({type(exc).__name__})")
-                return ""
+                button = page.locator(candidate).first
+                if (button.count() and button.is_visible()
+                        and button.is_enabled()):
+                    send_selector = candidate
+                    break
+            except Exception:
+                continue
+        if send_selector:
+            break
+        time.sleep(0.25)
+    if not send_selector:
+        print("    FAILURE: no enabled Send button found after the message was entered")
+        return ""
+    try:
+        send_button = page.locator(send_selector).first
+        send_button.click(timeout=15000)
+        print(f"    clicked send button: {send_selector}")
+    except Exception as exc:
+        print(f"    Send click failed ({type(exc).__name__})")
+        _chatgpt_shot(page, "send_click_failed")
+        try:
+            page.locator(selector).first.press("Enter", timeout=8000)
+            print("    submitted with Enter after the Send click failed")
+        except Exception:
+            return ""
+
+    # A click that reports success is not proof the message went. The
+    # composer emptying is.
+    if composer_text():
+        print("    message is still in the composer -- pressing Enter")
+        try:
+            page.locator(selector).first.press("Enter", timeout=8000)
+        except Exception:
+            page.keyboard.press("Enter")
+        deadline = time.time() + 3
+        while composer_text() and time.time() < deadline:
+            time.sleep(0.2)
+    if composer_text():
+        print("    FAILURE: ChatGPT did not submit the message")
+        _chatgpt_shot(page, "send_not_submitted")
+        return ""
 
     reply = _chatgpt_wait_for_reply(
         page, before, timeout=reply_timeout, baseline_text=baseline,
@@ -2383,12 +2311,9 @@ def chatgpt_send_message(page, text, label, reply_timeout=300, attach=None):
 
 # The master document, uploaded to the chat instead of pasting
 # RULES.md as text. Looked for next to the script first so it can be
-# kept with the project, then in Downloads where it currently lives.
+# kept with the project, then in Downloads.
 CHATGPT_RULES_PDF_NAME = "master doc for verification.pdf"
 
-# The master PDF converted to Markdown, at the project root. Preferred
-# over both the file and the raw PDF text -- see step 1 of
-# gpt_flow_mode() for why.
 # The rulebook sent to ChatGPT, newest version first. v3.1 is the
 # master document plus an incremental patch that tightens root-domain
 # control, business-type evidence, country inference, the three
@@ -2428,7 +2353,7 @@ def find_rules_pdf():
     Path to the master PDF, or "" if it is not where we expect.
 
     Next to the script, then the project root (where it is shared with
-    System 1), then Downloads as a last resort.
+    the other systems), then Downloads as a last resort.
     """
     found = project_file(CHATGPT_RULES_PDF_NAME)
     if found:
@@ -2508,9 +2433,36 @@ def chatgpt_attach_file(page, path, timeout=60000):
         return False
 
     try:
-        page.locator('input[type="file"]').first.set_input_files(path)
+        with open(path, "rb") as fh:
+            file_bytes = fh.read()
+        page.locator('input[type="file"]').first.set_input_files({
+            "name": name,
+            "mimeType": "text/plain",
+            "buffer": file_bytes,
+        })
     except Exception as exc:
         print(f"    the file was rejected ({type(exc).__name__}: {exc})")
+        return False
+
+    try:
+        selected = page.locator('input[type="file"]').first.evaluate(
+            "el => Boolean(el.files && el.files.length)"
+        )
+    except Exception:
+        selected = False
+    if selected:
+        print("    file selected; waiting briefly for ChatGPT upload")
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            for send_selector in CHATGPT_SEND_SELECTORS:
+                try:
+                    button = page.locator(send_selector).first
+                    if button.count() and button.is_visible() and button.is_enabled():
+                        return True
+                except Exception:
+                    pass
+            time.sleep(1)
+        print("    ChatGPT did not enable Send for this file")
         return False
 
     # Wait for the attachment to appear in the composer. The file name
@@ -2542,13 +2494,16 @@ def chatgpt_attach_file(page, path, timeout=60000):
 
 
 # What is said alongside the uploaded master document. Deliberately
-# short: the PDF carries the rules, the start-work instruction and the
-# exact output formats, so restating them here could only conflict
-# with it.
+# short: the rulebook carries the rules, the start-work instruction
+# and the exact output formats, so restating them here could only
+# conflict with it.
 RULES_PDF_PROMPT = (
-    "Understand this PDF. We have to start work. I will send website "
-    "URLs one at a time — verify each one against this document and "
-    "answer in the exact output format it specifies."
+    "Read the complete Markdown rulebook below as the controlling "
+    "instruction set. Preserve its headings, rules, exceptions, and "
+    "required output format. I will send one website URL at a time. "
+    "Verify each URL against the entire rulebook, never guess, and "
+    "return only the exact SKIP or QUALIFIES format required by it.\n\n"
+    "===== BEGIN MASTER RULEBOOK ====="
 )
 
 
@@ -2563,12 +2518,6 @@ RULES_FEED_PREAMBLE = (
     "mandatory field by inference.\n\n"
     "=== RULES.md ===\n\n"
 )
-
-
-# There is no record cap any more: --gpt-flow runs until the terminal
-# is closed or Ctrl+C is pressed. Failures recover in place instead of
-# ending the run, and an empty queue is waited out rather than treated
-# as the end of the work.
 
 
 # Lines that only a QUALIFIES answer carries. The master document's
@@ -2616,7 +2565,7 @@ GPT_PAID_TYPE_LOOKUP = {name.lower(): name for name in PAID_BUSINESS_TYPES}
 
 # The short forms the portal's country box is typed with. ChatGPT
 # writes the long name, so the same rule the decision engine applies
-# in portal_country_name() is applied to its wording too.
+# is applied to its wording too.
 GPT_COUNTRY_SHORT_FORMS = {
     "united states": "USA",
     "united states of america": "USA",
@@ -2686,7 +2635,7 @@ def parse_gpt_qualifies(answer):
     inferred and nothing is defaulted: an unreadable field block is a
     record left alone, not a record submitted with a guess.
     """
-    text = (answer or "").replace(" ", " ")
+    text = (answer or "").replace("\xa0", " ")
     text = re.sub(r"[*#`]", "", text)
 
     def grab(pattern):
@@ -2694,7 +2643,7 @@ def parse_gpt_qualifies(answer):
         return clean(match.group(1)) if match else ""
 
     email = grab(r"Email\s*:?\s*([^\s,;]+@[^\s,;]+)")
-    # A rendered link can glue a "↗" onto the address.
+    # A rendered link can glue a stray character onto the address.
     email = re.sub(r"[^A-Za-z0-9._%+\-@]+$", "", email)
     phone = grab(r"Phone(?:\s*(?:No|Number)\.?)?\s*:\s*([+0-9][0-9 ()\-]{5,})")
     phone = re.sub(r"[^0-9+]", "", phone)
@@ -2805,10 +2754,10 @@ def wait_for_portal_record_ready(portal, expected_url, timeout=40):
        offers a Not Working option" -- which reads exactly like an
        expired session and is not one.
 
-    2. Deciding a record takes ~20 seconds over in the ChatGPT tab. If
-       the portal moved on to a different record in the meantime, the
-       verdict for site A would be submitted against site B. The URL
-       is re-read and compared before anything is selected, and a
+    2. Deciding a record takes ~20 seconds over in the ChatGPT window.
+       If the portal moved on to a different record in the meantime,
+       the verdict for site A would be submitted against site B. The
+       URL is re-read and compared before anything is selected, and a
        mismatch submits nothing.
     """
     deadline = time.time() + timeout
@@ -2869,7 +2818,7 @@ def wait_for_portal_record_ready(portal, expected_url, timeout=40):
 
 def log_gpt_flow(assigned, verdict, outcome):
     """
-    One CSV line per record in debug2/gpt_flow_log.csv. This mode
+    One CSV line per record in debug3/gpt_flow_log.csv. This mode
     changes live portal records, so what was submitted and why has to
     exist somewhere other than terminal scrollback.
     """
@@ -2926,8 +2875,8 @@ def discard_fallback_profiles():
 
     Only ever called once the MAIN profile has opened successfully,
     which proves nothing holds a lock and so no fallback is in use.
-    Each one is a full Firefox profile of 35-40 MB and none of them
-    carries a ChatGPT session, so keeping them buys nothing.
+    Each one is a full Chrome profile and none of them carries a
+    ChatGPT session, so keeping them buys nothing.
     """
     prefix = os.path.basename(CHATGPT_PROFILE_DIR) + "_"
     parent = os.path.dirname(CHATGPT_PROFILE_DIR)
@@ -2958,8 +2907,7 @@ def discard_fallback_profiles():
 DEBUG_ARTEFACTS_TO_KEEP = 25
 
 # Never deleted, whatever their age. gpt_flow_log.csv is the record of
-# what this mode submitted to live portal records -- the audit trail --
-# and run_log.csv is the same for System 1.
+# what this mode submitted to live portal records -- the audit trail.
 DEBUG_KEEP_FOREVER_SUFFIXES = (".csv", ".log")
 
 
@@ -2967,10 +2915,10 @@ def prune_debug_artefacts(keep=None):
     """
     Keep the most recent screenshots and form dumps, delete older ones.
 
-    debug2/ grows without limit: every failed attach, rejected
-    composer, unready form and form dump lands there, and 51 files had
-    built up. Only the newest are ever of any use -- a screenshot from
-    two days ago explains nothing about today's run.
+    debug3/ grows without limit: every failed attach, rejected
+    composer, unready form and form dump lands there. Only the newest
+    are ever of any use -- a screenshot from two days ago explains
+    nothing about today's run.
 
     A count cap rather than an age cutoff, because a single bad hour
     can produce dozens of files while a quiet week produces none.
@@ -3052,7 +3000,7 @@ def wait_for_record_page(portal, poll=15):
             print(f"  still paused ({waited}s).")
 
 
-def feed_rulebook(gpt, who, rules):
+def feed_rulebook(gpt, who, rules, manual_send=False):
     """
     Put the rulebook into the current chat. Returns ChatGPT's
     acknowledgement, or "" if it never took.
@@ -3069,8 +3017,10 @@ def feed_rulebook(gpt, who, rules):
         if md_text:
             print(f"  {os.path.basename(md_path)}: {len(md_text)} characters")
             ack = chatgpt_send_message(
-                gpt, RULES_PDF_PROMPT + "\n\n" + md_text,
-                "master rules (Markdown)",
+                gpt,
+                md_text,
+                "master rules (one complete Markdown message)",
+                manual_send=manual_send,
             )
 
     if not ack and rules_pdf and who:
@@ -3087,45 +3037,13 @@ def feed_rulebook(gpt, who, rules):
                 gpt, RULES_PDF_PROMPT + "\n\n" + pdf_text, "master PDF text",
             )
 
-    if not ack and rules:
+    if not ack and rules and not who:
         print("  falling back to RULES.md")
         ack = chatgpt_send_message(
             gpt, RULES_FEED_PREAMBLE + rules, "RULES.md",
         )
 
     return ack
-
-
-def chatgpt_signin_wall(page):
-    """
-    The sign-in wall's text if the anonymous allowance has run out, or
-    None.
-
-    Distinct from the message-limit dialog, and not recoverable the
-    same way: that dialog offers a New chat which clears it, this one
-    replaces the composer entirely and follows the session rather than
-    the conversation. Retrying cannot help, so the caller waits.
-    """
-    text = _chatgpt_page_text(page, timeout=4000)
-    for marker in CHATGPT_SIGNIN_WALL_MARKERS:
-        if marker in text:
-            return marker
-    return None
-
-
-def chatgpt_message_limit(page):
-    """
-    The message-limit text showing on the page, or None.
-
-    Worth checking before blaming the composer: at the cap the send
-    button still clicks and the reply never comes, so a limited chat
-    and a wedged one look identical in the log.
-    """
-    text = _chatgpt_page_text(page, timeout=4000)
-    for marker in CHATGPT_LIMIT_MARKERS:
-        if marker in text:
-            return marker
-    return None
 
 
 def chatgpt_new_chat_from_limit(page):
@@ -3157,64 +3075,27 @@ def chatgpt_new_chat_from_limit(page):
 
 def restart_chat(gpt, who, rules):
     """
-    Open a brand-new chat and load the rulebook into it.
+    Keep using the current chat instead of opening a new conversation.
 
     The recovery for a ChatGPT tab that has stopped being useful --
     a wedged composer, an answer that never arrives, a reply that
     cannot be read. Cheaper than ending the run and starting over by
     hand, which is what used to happen.
-
-    At the message limit the dialog's own "New chat" option is taken
-    first: the cap is per conversation, so a new chat clears it, and
-    that route needs no navigation. The rulebook then goes into the
-    new chat exactly as it does at startup, and the record is retried
-    there -- the instructed recovery, 2026-09-07.
     """
-    print("  starting a fresh chat and re-loading the rulebook")
-
-    limit = chatgpt_message_limit(gpt)
-    took_dialog = False
-    if limit:
-        print(f"  ChatGPT reports: {limit}")
-        took_dialog = chatgpt_new_chat_from_limit(gpt)
-        if not took_dialog:
-            print("    the dialog's 'New chat' did not take -- navigating")
-
-    if not took_dialog:
-        try:
-            gpt.goto(
-                CHATGPT_HOME_URL, wait_until="domcontentloaded", timeout=40000,
-            )
-        except Exception as exc:
-            print(f"  could not open a new chat ({type(exc).__name__})")
-            return False
-
-    if _chatgpt_bot_wall(gpt):
-        print("  a bot check is in the way of the new chat.")
-        return False
-
-    ack = feed_rulebook(gpt, who, rules)
-    if not ack:
-        print("  the fresh chat did not accept the rulebook.")
-        return False
-    print("  fresh chat ready.")
+    print("  keeping the current ChatGPT conversation")
     return True
 
 
 def gpt_flow_mode(playwright):
     """
-    --gpt-flow : portal in one tab, ChatGPT in another, RULES.md fed
-    into the chat, then the portal's assigned URL sent into that same
-    chat. Read-only against the portal.
+    The default mode: portal in one Chrome window, ChatGPT in another,
+    the rulebook fed into the chat, then each assigned URL sent into
+    that same chat and the verdict submitted to the portal.
     """
     print("-" * 70)
-    print("PORTAL + CHATGPT FLOW  [SYSTEM 2]")
+    print("PORTAL + CHATGPT FLOW  [SYSTEM 3]")
 
-    # Any one of the three rulebook sources is enough. RULES.md is only
-    # the last-resort fallback now, so requiring it specifically was
-    # wrong: the mode refused to start with MASTER_RULES.md present and
-    # readable, purely because RULES.md had been moved into
-    # automation1\.
+    # Any one of the rulebook sources is enough.
     md_available = find_master_rules()
     pdf_available = find_rules_pdf()
     rules = read_rules_document()
@@ -3224,41 +3105,56 @@ def gpt_flow_mode(playwright):
         print(f"  {CHATGPT_RULES_PDF_NAME}, or RULES.md")
         return False
     print(f"  rulebook: {os.path.basename(md_available or pdf_available) or 'RULES.md'}")
+    print(f"  ChatGPT profile: {CHATGPT_PROFILE_DIR}")
+    print(f"  portal profile : {PORTAL_PROFILE_DIR}")
 
     context = None
+    portal_context = None
     try:
-        context = playwright.firefox.launch_persistent_context(
-            CHATGPT_PROFILE_DIR, headless=False,
-        )
+        context = launch_chrome_context(playwright, CHATGPT_PROFILE_DIR)
         # The main profile opened, so nothing holds a lock on it and
         # any one-off profiles left by earlier runs are dead weight.
-        # Three of them had accumulated to 118 MB before this cleanup
-        # existed.
         discard_fallback_profiles()
         prune_debug_artefacts()
     except Exception as exc:
-        # A Firefox left running from an earlier run keeps parent.lock
-        # held, and the profile cannot be reused while it does. Rather
+        # A Chrome left running from an earlier run holds the profile's
+        # SingletonLock, and it cannot be reused while it does. Rather
         # than refuse to run, fall back to a profile of its own -- but
         # say so, because a fresh profile carries no ChatGPT session.
         print(f"  the usual profile would not open ({type(exc).__name__}).")
         print(f"  Something still holds {CHATGPT_PROFILE_DIR}")
-        print("  -- most likely a Firefox window from an earlier run.")
+        print("  -- most likely a Chrome window from an earlier run.")
         fallback = CHATGPT_PROFILE_DIR + "_" + time.strftime("%Y%m%d_%H%M%S")
         print(f"  using a one-off profile instead: {fallback}")
-        print("  NOTE: a one-off profile is never signed into ChatGPT.")
+        print("  NOTE: a one-off profile is NEVER signed into ChatGPT, so")
+        print("  it will hit the anonymous message limit. Close the other")
+        print("  Chrome window and restart to use the real one.")
         try:
-            context = playwright.firefox.launch_persistent_context(
-                fallback, headless=False,
-            )
+            context = launch_chrome_context(playwright, fallback)
         except Exception as exc2:
             print(f"  that failed too ({type(exc2).__name__} {exc2})")
             return False
 
     try:
-        # ---- tab 1: the portal ----
-        print("\n[tab 1] portal")
-        portal = context.pages[0] if context.pages else context.new_page()
+        # ---- window 1: the portal, in its OWN profile ----
+        # It must be a separate user-data-dir: one Chrome profile
+        # cannot be driven by two playwright contexts at once.
+        print("\n[window 1] portal")
+        try:
+            portal_context = launch_chrome_context(
+                playwright, PORTAL_PROFILE_DIR,
+            )
+        except Exception as exc:
+            print(f"  the portal profile would not open "
+                  f"({type(exc).__name__} {exc})")
+            print(f"  Something still holds {PORTAL_PROFILE_DIR} --")
+            print("  most likely a Chrome window from an earlier run.")
+            return False
+
+        portal = (
+            portal_context.pages[0]
+            if portal_context.pages else portal_context.new_page()
+        )
         portal.set_default_timeout(7000)
         portal.set_default_navigation_timeout(PAGE_NAVIGATION_TIMEOUT)
         try:
@@ -3270,9 +3166,9 @@ def gpt_flow_mode(playwright):
             _chatgpt_shot(portal, "portal_login_failed")
             return False
 
-        # ---- tab 2: chatgpt.com, same window, same profile ----
-        print("\n[tab 2] chatgpt.com")
-        gpt = context.new_page()
+        # ---- window 2: chatgpt.com, in the signed-in profile ----
+        print("\n[window 2] chatgpt.com")
+        gpt = context.pages[0] if context.pages else context.new_page()
         gpt.set_default_timeout(CHATGPT_PAGE_TIMEOUT)
         gpt.set_default_navigation_timeout(40000)
         try:
@@ -3288,7 +3184,8 @@ def gpt_flow_mode(playwright):
         else:
             print("  NOT signed in -- using the anonymous chat.")
             print("  It works, but there is no history and the message")
-            print("  limit is lower. --chatgpt-login fixes that.")
+            print("  limit is much lower. Fix it with:")
+            print("      python website_verifier3.py --chatgpt-login")
 
         wall = _chatgpt_bot_wall(gpt)
         if wall:
@@ -3296,12 +3193,9 @@ def gpt_flow_mode(playwright):
             _chatgpt_shot(gpt, "gptflow_bot_wall")
             return False
 
-        # ---- feed the rulebook ----
-        # One implementation, shared with restart_chat() so a recovery
-        # loads exactly what the first attempt did.
         print("")
         print("[step 1] loading the rulebook into the chat")
-        ack = feed_rulebook(gpt, who, rules)
+        ack = feed_rulebook(gpt, who, rules, manual_send=True)
 
         # Keep trying rather than ending the run. The chat can refuse
         # the first attempt for reasons that clear on a retry -- a
@@ -3313,7 +3207,7 @@ def gpt_flow_mode(playwright):
             print(f"  the rulebook was not accepted (try {rulebook_tries}).")
             _chatgpt_shot(gpt, "gptflow_rules_no_reply")
             wait = min(30 * rulebook_tries, 300)
-            print(f"  waiting {wait}s, then starting a fresh chat.")
+            print(f"  waiting {wait}s, then trying again.")
             time.sleep(wait)
             if restart_chat(gpt, who, rules):
                 ack = "restarted"
@@ -3344,22 +3238,15 @@ def gpt_flow_mode(playwright):
             # A closed browser is the one failure that cannot be
             # recovered from, and retrying it forever is worse than
             # stopping: the loop sat waiting 30s at a time against a
-            # window that no longer existed. Everything else in here
-            # recovers; this ends the run.
+            # window that no longer existed.
             if portal.is_closed() or gpt.is_closed():
-                print("\n  the browser window was closed -- ending the run.")
+                print("\n  a browser window was closed -- ending the run.")
                 break
 
-            # Deliberately NOT bring_to_front(): raising the tab
-            # yanks the Firefox window in front of whatever the
-            # user is doing, once per record. Playwright drives
-            # background tabs perfectly well, so the run stays out
-            # of the way -- open the window from the taskbar to
-            # watch it.
-
-            # If the portal is on the Admin Console and we did not just
-            # put it there, someone is looking at their records. Wait
-            # rather than navigating away from under them.
+            # Deliberately NOT bring_to_front(): raising the window
+            # yanks Chrome in front of whatever the user is doing,
+            # once per record. Playwright drives background windows
+            # perfectly well, so the run stays out of the way.
             if portal_on_admin_console(portal):
                 wait_for_record_page(portal)
                 continue
@@ -3370,7 +3257,7 @@ def gpt_flow_mode(playwright):
                       "record page")
                 if not recover_portal_page(portal):
                     if portal.is_closed():
-                        continue    # handled at the top of the loop
+                        continue
                     print("  could not get a record page. Waiting 30s.")
                     time.sleep(30)
                 continue
@@ -3381,16 +3268,12 @@ def gpt_flow_mode(playwright):
                 seen += 1
             attempts += 1
 
-            print("\n" + "=" * 70)
             print(f"[record {seen}] {assigned}"
                   + (f"   (attempt {attempts})" if attempts > 1 else ""))
             print("=" * 70)
 
-            # A record that keeps failing gets a completely fresh chat
-            # before being tried again, since a wedged ChatGPT tab is
-            # the usual cause.
             if attempts in (3, 6, 9):
-                print("  this record keeps failing -- starting a fresh chat")
+                print("  this record keeps failing -- reusing the same chat")
                 if not restart_chat(gpt, who, rules):
                     print("  the fresh chat did not take. Waiting 60s.")
                     time.sleep(60)
@@ -3400,12 +3283,6 @@ def gpt_flow_mode(playwright):
                 print("  Waiting 5 minutes before trying again.")
                 time.sleep(300)
 
-            # Deliberately NOT bring_to_front(): raising the tab
-            # yanks the Firefox window in front of whatever the
-            # user is doing, once per record. Playwright drives
-            # background tabs perfectly well, so the run stays out
-            # of the way -- open the window from the taskbar to
-            # watch it.
             # The URL alone, with no instruction wrapped around it.
             # The master document already states what to do with a URL
             # and exactly how to answer; repeating it here could only
@@ -3416,27 +3293,12 @@ def gpt_flow_mode(playwright):
                 # Otherwise it is logged as a silent composer, and the
                 # real cause -- a conversation at its cap -- is
                 # invisible in the terminal.
-                # The sign-in wall first: it looks like a missing
-                # composer, but no amount of retrying clears it, and
-                # each retry re-sends the whole rulebook.
-                wall = chatgpt_signin_wall(gpt)
-                if wall:
-                    print(f"  ChatGPT is asking to sign in: {wall!r}")
-                    print("  The anonymous allowance is spent. A new chat")
-                    print("  does not clear this -- it follows the session.")
-                    print("  Sign in with --chatgpt-login, or clear the")
-                    print(f"  profile at {CHATGPT_PROFILE_DIR}.")
-                    print(f"  Waiting {SIGNIN_WALL_WAIT_SECONDS}s rather than "
-                          "retrying into it.")
-                    log_gpt_flow(assigned, "BLOCKED", "sign-in wall")
-                    time.sleep(SIGNIN_WALL_WAIT_SECONDS)
-                    continue
-
                 limit = chatgpt_message_limit(gpt)
                 if limit:
                     print(f"  ChatGPT hit its message limit: {limit}")
-                    print("  taking a new chat, re-loading the rulebook, and")
-                    print("  trying this record there. Nothing submitted.")
+                    print("  taking a new chat and trying this record there.")
+                    print("  Nothing submitted.")
+                    chatgpt_new_chat_from_limit(gpt)
                 else:
                     print("  no answer from ChatGPT -- nothing submitted.")
                     print("  restarting the chat and trying this record again.")
@@ -3459,20 +3321,18 @@ def gpt_flow_mode(playwright):
                     # unpaid record, a wrong Working is a paid
                     # submission of unverified data.
                     #
-                    # First time, ask again in a clean chat -- the
-                    # answer may have been garbled.
-                    #
-                    # Second time, the field really is unavailable, and
-                    # asking a third time just gets the same answer. A
-                    # masked email is the usual cause: sites behind
-                    # Cloudflare render "[email protected]" instead of
-                    # an address, and 15.1 forbids submitting a masked
-                    # one while GATE-003 makes an unverifiable
-                    # mandatory field a SKIP. So it goes in as Not
-                    # Working rather than looping to the 12-attempt
-                    # backoff.
+                    # First time, ask again -- the answer may have been
+                    # garbled. Second time, the field really is
+                    # unavailable, and asking a third time just gets
+                    # the same answer. A masked email is the usual
+                    # cause: sites behind Cloudflare render
+                    # "[email protected]" instead of an address, and
+                    # the rulebook forbids submitting a masked one
+                    # while making an unverifiable mandatory field a
+                    # SKIP. So it goes in as Not Working rather than
+                    # looping to the 12-attempt backoff.
                     if attempts < 2:
-                        print("  nothing submitted -- retrying in a fresh chat.")
+                        print("  nothing submitted -- retrying.")
                         log_gpt_flow(
                             assigned, verdict,
                             "not submitted (fields incomplete)",
@@ -3505,17 +3365,11 @@ def gpt_flow_mode(playwright):
                 print("  the verdict is not clear enough to act on.")
                 print("  Nothing submitted -- a decision is never guessed.")
                 log_gpt_flow(assigned, verdict, "not submitted (unclear)")
-                restart_chat(gpt, who, rules)
+                time.sleep(3)
                 continue
 
             # ---- submit, whichever way it went ----
             print(f"  submitting {action}")
-            # Deliberately NOT bring_to_front(): raising the tab
-            # yanks the Firefox window in front of whatever the
-            # user is doing, once per record. Playwright drives
-            # background tabs perfectly well, so the run stays out
-            # of the way -- open the window from the taskbar to
-            # watch it.
 
             ready = wait_for_portal_record_ready(portal, assigned)
             if ready == "mismatch":
@@ -3552,7 +3406,7 @@ def gpt_flow_mode(playwright):
             # happening. The failure message says "Nothing was
             # changed", so no submission went in and going back to try
             # once more cannot double-submit.
-            if not ok and "adminconsole" in (portal.url or "").lower():
+            if not ok and portal_on_admin_console(portal):
                 print("  the portal jumped to the Admin Console mid-submit")
                 print("  -- going back to the record page and retrying once")
                 recover_portal_page(portal)
@@ -3605,10 +3459,12 @@ def gpt_flow_mode(playwright):
         return True
 
     finally:
-        try:
-            context.close()
-        except Exception:
-            pass
+        for closeable in (context, portal_context):
+            try:
+                if closeable is not None:
+                    closeable.close()
+            except Exception:
+                pass
 
 
 def main():
@@ -3616,17 +3472,16 @@ def main():
     # been run by mistake more than once, and their failures look
     # identical to bugs in this one, so say the path outright.
     print("=" * 70)
-    print("WEBSITE VERIFIER [SYSTEM 2] -- running:", os.path.abspath(__file__))
-    print("Credentials: .env2   |   Debug output: debug2/")
+    print("WEBSITE VERIFIER [SYSTEM 3] -- running:", os.path.abspath(__file__))
+    print("Credentials: .env3   |   Debug output: debug3/   |   Browser: Chrome")
     print("=" * 70)
 
-    load_env_file(".env2")   # SYSTEM 2 -- its own credentials
+    load_env_file(".env3")   # SYSTEM 3 -- its own credentials
 
     with sync_playwright() as p:
 
-        # --chatgpt-login : ChatGPT only. Uses its own persistent
-        # profile and never opens the portal, so it returns before any
-        # other browser is launched.
+        # --chatgpt-login : ChatGPT only. Opens a normal Chrome window
+        # for the hand sign-in and never touches the portal.
         if CHATGPT_LOGIN_ONLY:
             chatgpt_login_mode(p)
             return
@@ -3634,9 +3489,7 @@ def main():
         # --login-only / --dump-form : portal only, and read-only.
         # Neither fills, clicks or submits anything.
         if PORTAL_LOGIN_ONLY or DUMP_FORM_ONLY:
-            # FIREFOX -- REQUIRED. Chrome and other auto-translating
-            # browsers break the language check.
-            browser = p.firefox.launch(headless=False)
+            browser = p.chromium.launch(channel="chrome", headless=False)
             try:
                 portal = browser.new_page()
                 portal.set_default_timeout(7000)
@@ -3664,12 +3517,15 @@ def main():
                     pass
             return
 
-        # Default (and --gpt-flow): the portal + ChatGPT flow. This is
-        # System 2's only verification engine -- the built-in crawler
-        # was removed on 2026-09-05 and lives on in System 1 at
-        # automation1\website_verifier.py.
+        # Default: the portal + ChatGPT flow, System 3's only engine.
         gpt_flow_mode(p)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nSTOPPED: interrupted by Ctrl+C.")
+    except Exception as exc:
+        print(f"\nFAILURE: {type(exc).__name__}: {exc}")
+        print("The verifier stopped. Check the latest debug3 screenshot/log.")
