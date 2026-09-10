@@ -2958,6 +2958,33 @@ def recover_portal_page(portal):
     return False
 
 
+def wipe_browser_profile(profile_dir):
+    """
+    Delete a browser profile outright -- cookies, cache, storage, the
+    lot. Returns True if the folder is gone or was never there.
+
+    This is the instructed recovery (2026-09-10): when a chat stops
+    taking URLs, do NOT reuse the tab. Close the window, clear
+    everything the browser saved, and come back as a completely fresh
+    visitor. Refreshing the same chat cannot work, because what has
+    been spent is the anonymous allowance, and that is held in exactly
+    this folder.
+
+    The caller MUST have closed the browser first. Deleting a profile
+    out from under a live browser corrupts it.
+    """
+    import shutil
+    if not os.path.isdir(profile_dir):
+        return True
+    try:
+        shutil.rmtree(profile_dir)
+        return True
+    except Exception as exc:
+        print(f"    could not clear {os.path.basename(profile_dir)} "
+              f"({type(exc).__name__}) -- a file is still held open")
+        return False
+
+
 def discard_fallback_profiles():
     """
     Delete the one-off browser profiles earlier runs fell back to.
@@ -3359,6 +3386,74 @@ def gpt_flow_mode(playwright):
             _chatgpt_shot(gpt, "gptflow_bot_wall")
             return False
 
+        def hard_reset_chatgpt(rules_text):
+            """
+            Close the ChatGPT browser, delete everything it saved, open
+            a fresh one, and load the rulebook into it.
+
+            The instructed recovery for a chat that has stopped being
+            useful. Reopening a chat in the same browser cannot help
+            once the anonymous allowance is gone, because the
+            allowance lives in the profile -- so the profile is what
+            has to go. Coming back with no cookies and no cache is
+            coming back as a new visitor, which is the only thing that
+            actually restores the quota.
+
+            Only available with --chatgpt-chrome, where ChatGPT has a
+            browser of its own. In Firefox mode the ChatGPT tab shares
+            the portal's profile, and wiping it would log the portal
+            out mid-record.
+            """
+            nonlocal gpt, gpt_context
+            if not CHATGPT_USE_CHROME:
+                return False
+
+            print("  closing the ChatGPT window and clearing everything "
+                  "it saved")
+            try:
+                gpt_context.close()
+            except Exception:
+                pass
+            gpt_context, gpt = None, None
+
+            # Chrome writes on its way out; deleting too early leaves
+            # files held open and the wipe half-done.
+            time.sleep(3)
+            if not wipe_browser_profile(CHATGPT_CHROME_PROFILE_DIR):
+                return False
+            print("    cache, cookies and stored data cleared")
+
+            try:
+                gpt_context = playwright.chromium.launch_persistent_context(
+                    CHATGPT_CHROME_PROFILE_DIR,
+                    channel="chrome",
+                    headless=False,
+                    args=["--disable-extensions"]
+                    + list(CHROME_NO_MODEL_DOWNLOAD_ARGS),
+                )
+            except Exception as exc:
+                print(f"    Chrome would not restart ({type(exc).__name__})")
+                return False
+
+            gpt = (gpt_context.pages[0] if gpt_context.pages
+                   else gpt_context.new_page())
+            gpt.set_default_timeout(CHATGPT_PAGE_TIMEOUT)
+            gpt.set_default_navigation_timeout(40000)
+            try:
+                gpt.goto(CHATGPT_HOME_URL, wait_until="domcontentloaded",
+                         timeout=40000)
+            except Exception as exc:
+                print(f"    fresh Chrome could not open chatgpt.com "
+                      f"({type(exc).__name__})")
+                return False
+
+            print("    fresh browser open -- reloading the rulebook")
+            if not feed_rulebook(gpt, _chatgpt_session_user(gpt), rules_text):
+                print("    the fresh browser did not accept the rulebook.")
+                return False
+            print("    ready again.")
+            return True
+
         # ---- feed the rulebook ----
         # One implementation, shared with restart_chat() so a recovery
         # loads exactly what the first attempt did.
@@ -3487,6 +3582,14 @@ def gpt_flow_mode(playwright):
                 # composer, but no amount of retrying clears it, and
                 # each retry re-sends the whole rulebook.
                 wall = chatgpt_signin_wall(gpt)
+                if wall and hard_reset_chatgpt(rules):
+                    # A clean browser has a clean allowance, so the
+                    # record is tried again straight away instead of
+                    # waiting the wall out.
+                    print("  cleared and restarted -- retrying this record.")
+                    log_gpt_flow(assigned, "RESET", "cleared browser, retrying")
+                    continue
+
                 if wall:
                     # The allowance resets on its own after a while, so
                     # this waits it out and resumes rather than ending
@@ -3511,6 +3614,15 @@ def gpt_flow_mode(playwright):
                     continue
 
                 limit = chatgpt_message_limit(gpt)
+                if limit and hard_reset_chatgpt(rules):
+                    # Same reasoning as the sign-in wall: a new chat in
+                    # the same browser keeps the spent allowance, a new
+                    # browser does not.
+                    print(f"  message limit ({limit}) -- cleared and "
+                          "restarted, retrying this record.")
+                    log_gpt_flow(assigned, "RESET", "cleared browser, retrying")
+                    continue
+
                 if limit:
                     print(f"  ChatGPT hit its message limit: {limit}")
                     print("  taking a new chat, re-loading the rulebook, and")
