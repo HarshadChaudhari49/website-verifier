@@ -24,6 +24,11 @@ chatgpt_profile2_*/
 **/chatgpt_profile2/
 **/chatgpt_profile2_*/
 
+# System 2's Chrome ChatGPT profile (--chatgpt-chrome). A browser
+# profile with live cookies -- never commit it.
+chatgpt_chrome_profile2/
+**/chatgpt_chrome_profile2/
+
 # --- Run output: portal screenshots, form dumps with CSRF tokens,
 #     and the per-record run logs ---
 debug/

@@ -188,6 +188,33 @@ CHATGPT_LOGIN_ONLY = "--chatgpt-login" in sys.argv[1:]
 PORTAL_LOGIN_ONLY = "--login-only" in sys.argv[1:]
 PORTAL_HOLD_SECONDS = 1800
 
+# Run the ChatGPT tab in CHROME instead of Firefox:
+#     python website_verifier2.py --chatgpt-chrome
+#
+# The anonymous message allowance follows the BROWSER PROFILE, so
+# Chrome carries an allowance of its own that Firefox's exhaustion
+# does not touch. Measured 2026-09-10 with Firefox's already spent: a
+# fresh Chrome profile loaded chatgpt.com with no login wall, held the
+# whole 75,446-character rulebook, and answered a browsing question
+# about pedrick.com correctly, citing the site. So this is a second
+# budget to switch to, not an unlimited one -- expect it to cap in
+# its turn.
+#
+# Chrome is safe HERE specifically, despite NOTE 3's Firefox-only
+# rule. That rule exists because Chrome auto-translates a foreign
+# site and defeats the language check -- but in this mode our browser
+# never opens the assigned website at all. ChatGPT fetches it. The
+# portal tab stays in Firefox either way.
+CHATGPT_USE_CHROME = "--chatgpt-chrome" in sys.argv[1:]
+
+# Chrome pulls its ~4 GB on-device model into any fresh profile it is
+# given unless told not to. Nothing to do with ChatGPT, and it is pure
+# waste here.
+CHROME_NO_MODEL_DOWNLOAD_ARGS = [
+    "--disable-features=OptimizationGuideModelDownloading,"
+    "OptimizationGuideOnDeviceModel,OptimizationHints",
+]
+
 
 MIN_QUALIFYING_PRODUCTS = 3
 
@@ -1152,6 +1179,12 @@ CHATGPT_PAGE_TIMEOUT = 15000
 # Cookies live here, next to the script, so System 2 keeps its own
 # ChatGPT session and never shares one with System 1.
 CHATGPT_PROFILE_DIR = os.path.join(script_dir(), "chatgpt_profile2")
+
+# Chrome's own ChatGPT profile, kept separate from the Firefox one so
+# each keeps its own message allowance -- the whole point of
+# --chatgpt-chrome. Git-ignored like the Firefox profile.
+CHATGPT_CHROME_PROFILE_DIR = os.path.join(
+    script_dir(), "chatgpt_chrome_profile2")
 
 # How long --chatgpt-login waits for a hand sign-in before giving up.
 # 15 minutes. 5 was not enough in practice: the hand sign-in ran
@@ -3231,6 +3264,7 @@ def gpt_flow_mode(playwright):
     print(f"  rulebook: {os.path.basename(md_available or pdf_available) or 'RULES.md'}")
 
     context = None
+    gpt_context = None      # only used by --chatgpt-chrome
     try:
         context = playwright.firefox.launch_persistent_context(
             CHATGPT_PROFILE_DIR, headless=False,
@@ -3275,9 +3309,33 @@ def gpt_flow_mode(playwright):
             _chatgpt_shot(portal, "portal_login_failed")
             return False
 
-        # ---- tab 2: chatgpt.com, same window, same profile ----
+        # ---- tab 2: chatgpt.com ----
+        # Firefox by default: same window, same profile, one browser.
+        # With --chatgpt-chrome it is a SEPARATE Chrome window with its
+        # own profile, because the anonymous allowance follows the
+        # profile and Chrome's is untouched by Firefox's.
         print("\n[tab 2] chatgpt.com")
-        gpt = context.new_page()
+        if CHATGPT_USE_CHROME:
+            print("  browser: CHROME (its own message allowance)")
+            print(f"  profile: {CHATGPT_CHROME_PROFILE_DIR}")
+            try:
+                gpt_context = playwright.chromium.launch_persistent_context(
+                    CHATGPT_CHROME_PROFILE_DIR,
+                    channel="chrome",
+                    headless=False,
+                    args=["--disable-extensions"]
+                    + list(CHROME_NO_MODEL_DOWNLOAD_ARGS),
+                )
+            except Exception as exc:
+                print(f"  Chrome would not start ({type(exc).__name__} {exc}).")
+                print("  Is Google Chrome installed? Without --chatgpt-chrome")
+                print("  the run uses Firefox as before.")
+                return False
+            gpt = (gpt_context.pages[0] if gpt_context.pages
+                   else gpt_context.new_page())
+        else:
+            print("  browser: Firefox (same window as the portal)")
+            gpt = context.new_page()
         gpt.set_default_timeout(CHATGPT_PAGE_TIMEOUT)
         gpt.set_default_navigation_timeout(40000)
         try:
@@ -3640,10 +3698,15 @@ def gpt_flow_mode(playwright):
         return True
 
     finally:
-        try:
-            context.close()
-        except Exception:
-            pass
+        # Chrome first: it is a second, independent browser under
+        # --chatgpt-chrome, and leaving it open would hold the lock on
+        # its profile so the next run could not reuse the session.
+        for closing in (gpt_context, context):
+            try:
+                if closing is not None:
+                    closing.close()
+            except Exception:
+                pass
 
 
 def main():
