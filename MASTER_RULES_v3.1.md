@@ -58,7 +58,7 @@ User explicit working instructions in chat Additional mandatory operating instru
 
 \- If there is a Payment Gateway option, that is counted in billing only for Manufacture.
 
-**## 3.2 Unpaid / Rejected / Non-Paid Categories**
+**## 3.2 Unpaid / Rejected / Non-Paid Categories** ---give this site as SKIP AND IF ANY IMAGE/PHOTOS IS PRESENT ON THAT SITE IN ANY TABS/SECTION/PAGES THEN GIVE  IT AS SKIP.   
 
 \- Indian (IN) and Chinese (CN) websites are not for work, subject to the Hong Kong and Macau country-menu exceptions described later.
 

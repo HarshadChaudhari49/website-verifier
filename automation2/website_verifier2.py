@@ -1839,6 +1839,11 @@ CHATGPT_SIGNIN_WALL_MARKERS = (
 # characters of rulebook into a session that will refuse it.
 SIGNIN_WALL_WAIT_SECONDS = 300
 
+# The wait doubles on each successive hold, up to this. Half an hour
+# is long enough not to hammer a wall that will not move, and short
+# enough that the run picks up promptly once the allowance resets.
+SIGNIN_WALL_MAX_WAIT_SECONDS = 1800
+
 # The "Message limit reached" dialog. An anonymous chat has a low cap;
 # once it is hit the send button still clicks and the answer simply
 # never arrives, which reads exactly like a wedged composer. The cap is
@@ -3338,6 +3343,7 @@ def gpt_flow_mode(playwright):
         qualified = 0
         seen = 0
         attempts = 0          # consecutive failures on the CURRENT url
+        wall_waits = 0        # consecutive holds at the sign-in wall
         last_url = ""
 
         while True:
@@ -3378,6 +3384,9 @@ def gpt_flow_mode(playwright):
             if assigned != last_url:
                 last_url = assigned
                 attempts = 0
+                # A new record means the previous one went through, so
+                # the wall has lifted and the backoff starts over.
+                wall_waits = 0
                 seen += 1
             attempts += 1
 
@@ -3421,15 +3430,26 @@ def gpt_flow_mode(playwright):
                 # each retry re-sends the whole rulebook.
                 wall = chatgpt_signin_wall(gpt)
                 if wall:
+                    # The allowance resets on its own after a while, so
+                    # this waits it out and resumes rather than ending
+                    # the run. The wait doubles each time, because a
+                    # wall that is still up after five minutes is
+                    # usually up for a good deal longer, and a tight
+                    # loop here achieves nothing.
+                    wall_waits += 1
+                    wait = min(
+                        SIGNIN_WALL_WAIT_SECONDS * (2 ** (wall_waits - 1)),
+                        SIGNIN_WALL_MAX_WAIT_SECONDS,
+                    )
                     print(f"  ChatGPT is asking to sign in: {wall!r}")
                     print("  The anonymous allowance is spent. A new chat")
                     print("  does not clear this -- it follows the session.")
-                    print("  Sign in with --chatgpt-login, or clear the")
-                    print(f"  profile at {CHATGPT_PROFILE_DIR}.")
-                    print(f"  Waiting {SIGNIN_WALL_WAIT_SECONDS}s rather than "
-                          "retrying into it.")
-                    log_gpt_flow(assigned, "BLOCKED", "sign-in wall")
-                    time.sleep(SIGNIN_WALL_WAIT_SECONDS)
+                    print(f"  Waiting {wait}s (hold {wall_waits}), then "
+                          "trying this record again.")
+                    print("  It resumes by itself once the allowance resets.")
+                    log_gpt_flow(
+                        assigned, "BLOCKED", f"sign-in wall (waiting {wait}s)")
+                    time.sleep(wait)
                     continue
 
                 limit = chatgpt_message_limit(gpt)
@@ -3439,8 +3459,14 @@ def gpt_flow_mode(playwright):
                     print("  trying this record there. Nothing submitted.")
                 else:
                     print("  no answer from ChatGPT -- nothing submitted.")
-                    print("  restarting the chat and trying this record again.")
                 _chatgpt_shot(gpt, "gptflow_no_verdict")
+                # A silent answer is often transient -- a slow reply,
+                # a re-render. Try the same chat once before spending
+                # a rulebook on a fresh one; the loop still escalates
+                # to a fresh chat at attempt 3.
+                if attempts < 2 and not limit:
+                    print("  trying again in the same chat first.")
+                    continue
                 restart_chat(gpt, who, rules)
                 continue
 
@@ -3472,12 +3498,16 @@ def gpt_flow_mode(playwright):
                     # Working rather than looping to the 12-attempt
                     # backoff.
                     if attempts < 2:
-                        print("  nothing submitted -- retrying in a fresh chat.")
+                        print("  nothing submitted -- asking again in the "
+                              "same chat.")
                         log_gpt_flow(
                             assigned, verdict,
                             "not submitted (fields incomplete)",
                         )
-                        restart_chat(gpt, who, rules)
+                        # Same chat, for the same reason as the
+                        # unclear-verdict path: the answer arrived, so
+                        # the chat works, and a rulebook re-send buys
+                        # nothing but spends the allowance.
                         continue
 
                     print("  the field block is still incomplete on attempt "
@@ -3505,7 +3535,12 @@ def gpt_flow_mode(playwright):
                 print("  the verdict is not clear enough to act on.")
                 print("  Nothing submitted -- a decision is never guessed.")
                 log_gpt_flow(assigned, verdict, "not submitted (unclear)")
-                restart_chat(gpt, who, rules)
+                # Re-ask in the SAME chat. The chat is not broken --
+                # it answered, just not usefully -- and a fresh one
+                # costs a 75,319-character rulebook re-send, which is
+                # what actually exhausts the anonymous allowance. The
+                # loop escalates to a fresh chat at attempt 3 anyway.
+                print("  asking again in the same chat.")
                 continue
 
             # ---- submit, whichever way it went ----
