@@ -55,6 +55,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import subprocess
 import sys
 import time
 from collections import deque
@@ -206,6 +207,17 @@ PORTAL_HOLD_SECONDS = 1800
 # never opens the assigned website at all. ChatGPT fetches it. The
 # portal tab stays in Firefox either way.
 CHATGPT_USE_CHROME = "--chatgpt-chrome" in sys.argv[1:]
+
+# Every start clears Chrome's ChatGPT profile before opening it, so a
+# run always begins as a brand-new visitor with a full allowance --
+# instructed 2026-09-10. Carrying yesterday's cookies forward only
+# carries yesterday's spent quota with them.
+#
+# --keep-chatgpt-profile turns that off. It exists for one case: a
+# profile that has been SIGNED IN by hand. Clearing that would throw
+# the session away and drop the run back to the anonymous limit, which
+# is the opposite of what the clearing is for.
+CHATGPT_KEEP_PROFILE = "--keep-chatgpt-profile" in sys.argv[1:]
 
 # Chrome pulls its ~4 GB on-device model into any fresh profile it is
 # given unless told not to. Nothing to do with ChatGPT, and it is pure
@@ -2976,13 +2988,52 @@ def wipe_browser_profile(profile_dir):
     import shutil
     if not os.path.isdir(profile_dir):
         return True
+
+    for attempt in range(3):
+        try:
+            shutil.rmtree(profile_dir)
+            return True
+        except Exception as exc:
+            # Windows refuses to delete a folder anything still has
+            # open, so the browser holding it has to go first. Seen
+            # live: a Chrome left over from the previous run kept the
+            # lock, the clear failed with PermissionError, and the
+            # fresh start silently was not fresh.
+            if attempt == 0:
+                print(f"    {os.path.basename(profile_dir)} is still open "
+                      f"({type(exc).__name__}) -- closing what holds it")
+                close_browsers_on_profile(profile_dir)
+            time.sleep(2)
+
+    print(f"    could not clear {os.path.basename(profile_dir)} -- "
+          "something still holds it open")
+    return False
+
+
+def close_browsers_on_profile(profile_dir):
+    """
+    Kill only the browsers running on THIS profile folder.
+
+    Matched on the command line, so the user's own Chrome windows are
+    never touched -- a blanket "kill chrome" would close their real
+    browsing, which is not ours to do.
+    """
+    leaf = os.path.basename(profile_dir)
+    script = (
+        "Get-CimInstance Win32_Process "
+        "-Filter \"Name='chrome.exe' or Name='firefox.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -like '*{leaf}*' }} | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+        "-ErrorAction SilentlyContinue }"
+    )
     try:
-        shutil.rmtree(profile_dir)
-        return True
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            timeout=30, capture_output=True,
+        )
+        time.sleep(2)
     except Exception as exc:
-        print(f"    could not clear {os.path.basename(profile_dir)} "
-              f"({type(exc).__name__}) -- a file is still held open")
-        return False
+        print(f"    could not close them ({type(exc).__name__})")
 
 
 def discard_fallback_profiles():
@@ -3128,6 +3179,18 @@ def feed_rulebook(gpt, who, rules):
     rules_pdf = find_rules_pdf()
     ack = ""
 
+    def blocked():
+        """
+        True once the chat has stopped accepting anything at all.
+
+        The fallbacks exist for a rulebook that was REFUSED -- too
+        long, badly rendered, a wedged composer. None of them helps
+        against a spent allowance, where the next send fails exactly
+        like the last. Walking the chain anyway just pushed 52,778
+        more characters at a wall, seen live 2026-09-10.
+        """
+        return bool(chatgpt_signin_wall(gpt) or chatgpt_message_limit(gpt))
+
     md_path = find_master_rules()
     if md_path:
         md_text = read_text_file(md_path)
@@ -3137,6 +3200,11 @@ def feed_rulebook(gpt, who, rules):
                 gpt, RULES_PDF_PROMPT + "\n\n" + md_text,
                 "master rules (Markdown)",
             )
+
+    if not ack and blocked():
+        print("  the chat is refusing everything -- not trying the "
+              "fallbacks, they cannot help here.")
+        return ""
 
     if not ack and rules_pdf and who:
         print("  trying to upload the PDF itself...")
@@ -3345,6 +3413,16 @@ def gpt_flow_mode(playwright):
         if CHATGPT_USE_CHROME:
             print("  browser: CHROME (its own message allowance)")
             print(f"  profile: {CHATGPT_CHROME_PROFILE_DIR}")
+            # Start every run as a new visitor. Anything the last run
+            # left behind carries its spent allowance with it.
+            if CHATGPT_KEEP_PROFILE:
+                print("  keeping the saved profile "
+                      "(--keep-chatgpt-profile)")
+            elif os.path.isdir(CHATGPT_CHROME_PROFILE_DIR):
+                print("  clearing the saved cache, cookies and data "
+                      "for a fresh start")
+                if wipe_browser_profile(CHATGPT_CHROME_PROFILE_DIR):
+                    print("    cleared.")
             try:
                 gpt_context = playwright.chromium.launch_persistent_context(
                     CHATGPT_CHROME_PROFILE_DIR,
@@ -3470,6 +3548,23 @@ def gpt_flow_mode(playwright):
             rulebook_tries += 1
             print(f"  the rulebook was not accepted (try {rulebook_tries}).")
             _chatgpt_shot(gpt, "gptflow_rules_no_reply")
+
+            # A wall at STARTUP needs the same answer as one mid-run:
+            # close the browser, clear it, come back new. Waiting and
+            # opening another chat cannot help, because the allowance
+            # that is gone belongs to the profile. This path used to
+            # miss that and cycle the fallbacks instead.
+            blocker = chatgpt_signin_wall(gpt) or chatgpt_message_limit(gpt)
+            if blocker:
+                print(f"  ChatGPT is refusing outright: {blocker!r}")
+                if hard_reset_chatgpt(rules):
+                    ack = "restarted"
+                    break
+                print("  could not clear and restart -- waiting before "
+                      "another go.")
+                time.sleep(min(60 * rulebook_tries, 900))
+                continue
+
             wait = min(30 * rulebook_tries, 300)
             print(f"  waiting {wait}s, then starting a fresh chat.")
             time.sleep(wait)
